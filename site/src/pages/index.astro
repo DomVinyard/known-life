@@ -105,8 +105,7 @@ const starLabel =
         <div class="split-copy">
           <div class="eyebrow">What is life?</div>
           <h2>A git repo that <span style="color:var(--coral)">remembers, acts, and evolves</span>.</h2>
-          <p class="lead">Life is open — you bring your own everything. Your repo sits in the middle and <em>is</em> the agent; a harness runs it from above, infrastructure carries it below, and each side is yours to choose and swap without touching the other. The repo gains a self that persists, a safe way to act, and room to grow.</p>
-          <p class="model-close">And it's all open source — every harness, every cloud, the whole genepool yours to use. All life shares the same genepool: <code>inherit</code> a gene by name, <code>mutate</code> your own back into the commons, and <code>evolve</code> to grow new capabilities.</p>
+          <p class="lead">Life is open — you bring your own everything. Your repo sits in the middle and <em>is</em> the agent; a harness runs it from above, infrastructure carries it below, each side yours to swap without touching the other. The repo gains a self that persists, a safe way to act, and room to grow — and it's all open source, every harness and cloud yours to use.</p>
         </div>
 
         <div class="diagram" role="img" aria-label="A harness — Claude Code, with Cursor and Codex coming soon — runs your repo in the middle; the repo deploys to infrastructure — Cloudflare, with Vercel coming soon.">
@@ -139,6 +138,7 @@ const starLabel =
       <section class="block" id="registry">
         <div class="eyebrow">genepool</div>
         <h2>Popular genes.</h2>
+        <p class="reg-intro">All life shares the same genepool: <code>inherit</code> a gene by name, <code>mutate</code> your own back into the commons, and <code>evolve</code> to grow new capabilities.</p>
 
         <form class="reg-search" action="/search" method="get" role="search">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
@@ -343,16 +343,16 @@ const starLabel =
   .life-home section.block{padding:62px 0 6px}
   .life-home section.block.split{display:grid; grid-template-columns:1fr 1fr; gap:48px; align-items:center}
   .life-home .split-copy .lead{max-width:42ch}
-  /* Closing line of the left column — hands off to the genepool. */
-  .life-home .model-close{max-width:42ch; margin:14px 0 0;
+  /* Intro line under the genepool heading — names the three core verbs. */
+  .life-home .reg-intro{max-width:60ch; margin:12px 0 0;
     font-size:17px; color:var(--ink-soft); line-height:1.7}
-  .life-home .model-close code{font-family:"Spline Sans Mono",monospace; font-size:.86em;
+  .life-home .reg-intro code{font-family:"Spline Sans Mono",monospace; font-size:.86em;
     background:var(--panel-2); color:var(--teal); padding:1px 6px; border-radius:5px}
   @media(max-width:860px){
     .life-home section.block.split{grid-template-columns:1fr; gap:24px}
   }
   .life-home .eyebrow{font-family:"Spline Sans Mono",monospace; font-size:12px; letter-spacing:.2em; text-transform:uppercase; color:var(--teal); margin-bottom:14px}
-  .life-home h2{font-family:"Unbounded",sans-serif; font-weight:700; font-size:clamp(26px,3.6vw,38px); letter-spacing:-.01em; line-height:1.06; color:var(--ink)}
+  .life-home h2{font-family:"Unbounded",sans-serif; font-weight:700; font-size:clamp(26px,3.6vw,38px); letter-spacing:-.01em; line-height:1.06; color:var(--ink); text-wrap:balance}
   .life-home h2 .em{background:linear-gradient(100deg,var(--magenta),var(--coral) 50%,var(--peach)); -webkit-background-clip:text; background-clip:text; color:transparent; font-style:italic}
   .life-home .lead{font-size:17px; color:var(--ink-soft); max-width:54ch; margin-top:14px}
 
