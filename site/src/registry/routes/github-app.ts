@@ -28,7 +28,11 @@ import { verifyGithubIdentity } from "../lib/lifekey-verify.mjs";
  */
 
 const GH = "https://api.github.com";
-const APP_PERMS = { contents: "write", metadata: "read" } as const;
+// contents:write — write the merge commit (and reap throwaway branches);
+// checks:read — read a head SHA's check-runs to gate `merge-pr` on green
+// (the Option-B server-side gate; the existing install must re-accept this one
+// permission delta); metadata:read — installation lookup.
+const APP_PERMS = { contents: "write", checks: "read", metadata: "read" } as const;
 const STATE_TTL_S = 600;
 const DELETABLE_REF = /^life-bootstrap\/[a-f0-9]{8,}$/;
 
@@ -345,6 +349,82 @@ export async function handleExchangeDeleteBranch(req: Request, env: Env): Promis
   const ok = del.status === 204 || already;
   if (!ok) return json(502, { ok: false, error: `github delete failed (${del.status})` });
   return json(200, { ok: true, branch, already_gone: already });
+}
+
+// POST /exchange/merge-pr { repo, pr, branch, sha } — squash-merge a PR a session
+// can't merge itself (no GitHub token; the in-session MCP merge dance is trap-
+// ridden — casing traps, auto-merge that won't arm, no green-success webhook).
+// Same App-on-central spine + owner-lifekey caller-auth as /exchange/delete-branch.
+// Guarded HARD, no PR read needed (so no `pull_requests` permission):
+//   - the caller passes the head it wants merged, { branch, sha }; we refuse
+//     unless `branch` is a claude/* head (a guardrail — the caller is already
+//     owner-authenticated, and merging is a non-destructive owner-capable act).
+//   - GREEN GATE (Option B): we read the SHA's check-runs (checks:read) and merge
+//     ONLY when every run concluded success — pending → { ok:false, pending:true }
+//     (the verb polls), any failure → { ok:false, failed:true, checks:[…] }.
+//   - the merge is PINNED to the gated SHA (the merge API's `sha` guard): if the
+//     PR head moved since the gate, GitHub 409s and we never merge an un-gated
+//     commit. The SHA — not the PR number — is the security-bearing input.
+// contents:write (held) authorizes the merge; checks:read authorizes the gate.
+const MERGE_FAIL_CONCLUSIONS = new Set(["failure", "timed_out", "cancelled", "action_required", "startup_failure", "stale"]);
+const MERGEABLE_HEAD = /^claude\/[A-Za-z0-9._/-]+$/;
+export async function handleExchangeMergePR(req: Request, env: Env): Promise<Response> {
+  const ip = req.headers.get("CF-Connecting-IP") ?? "unknown";
+  const rl = await checkRate(env, `ghmergepr:${ip}`, 60, 60);
+  if (!rl.ok) return json(429, { ok: false, error: "rate_limited" });
+
+  const body = await req.json().catch(() => null) as { repo?: string; pr?: number; branch?: string; sha?: string; sig?: string; ts?: number } | null;
+  const repo = body?.repo, pr = body?.pr, branch = body?.branch, sha = body?.sha;
+  if (!repoOk(repo)) return json(400, { ok: false, error: "repo required (owner/repo)" });
+  if (!Number.isInteger(pr) || (pr as number) <= 0) return json(400, { ok: false, error: "pr (positive integer) required" });
+  if (typeof branch !== "string" || !MERGEABLE_HEAD.test(branch) || branch.includes("..")) {
+    return json(403, { ok: false, error: "refusing: only claude/* PRs are mergeable" });
+  }
+  if (typeof sha !== "string" || !/^[0-9a-f]{40}$/.test(sha)) {
+    return json(400, { ok: false, error: "sha (40 hex — the head commit to gate + merge) required" });
+  }
+  // Caller-auth BEFORE any GitHub call (same scheme as /exchange/delete-branch):
+  // the vault signs (repo, sha, ts) with the owner's lifekey. Binding the subject
+  // to the SHA pins the signature to the exact commit being merged — it can't be
+  // replayed to merge a later, un-gated head.
+  if (!(await verifyCaller("merge-pr", repo, sha, body?.sig, body?.ts))) {
+    return json(401, { ok: false, error: "caller auth failed" });
+  }
+
+  const tok = await installationToken(env, repo);
+  if (tok === null) return json(503, { ok: false, error: "verifier app not registered" });
+  if ("notInstalled" in tok) return json(200, { ok: false, reason: "not_installed" });
+  const gh = (p: string, init?: RequestInit) => fetch(`${GH}/repos/${repo}${p}`, { ...init, headers: { ...ghHeaders(tok.token), ...(init && init.headers) } });
+
+  // Green gate: every check-run on the head SHA must have concluded success.
+  // Zero runs (CI not yet reported, or none configured) reads as pending — the
+  // verb retries; better an honest wait than merging an ungated head.
+  const cr = await gh(`/commits/${sha}/check-runs`);
+  if (!cr.ok) return json(502, { ok: false, error: `check-runs read failed (${cr.status})` });
+  const runs = await cr.json().catch(() => ({})) as { total_count?: number; check_runs?: Array<{ name?: string; status?: string; conclusion?: string }> };
+  const list = Array.isArray(runs.check_runs) ? runs.check_runs : [];
+  if ((runs.total_count ?? 0) === 0 || list.some((c) => c.status !== "completed")) {
+    return json(200, { ok: false, pending: true, total: runs.total_count ?? 0 });
+  }
+  const failed = list.filter((c) => MERGE_FAIL_CONCLUSIONS.has(String(c.conclusion))).map((c) => c.name ?? "?");
+  if (failed.length) return json(200, { ok: false, failed: true, checks: failed });
+
+  // All green → squash-merge, pinned to the gated SHA.
+  const mr = await gh(`/pulls/${pr}/merge`, { method: "PUT", body: JSON.stringify({ merge_method: "squash", sha }) });
+  if (mr.status === 200) {
+    const j = await mr.json().catch(() => ({})) as { sha?: string };
+    return json(200, { ok: true, merged: true, sha: j.sha ?? sha });
+  }
+  if (mr.status === 409) return json(409, { ok: false, error: "head moved since the green gate — re-run merge-pr" });
+  if (mr.status === 405) {
+    const j = await mr.json().catch(() => ({})) as { message?: string };
+    return json(409, { ok: false, error: `not mergeable: ${j.message ?? "branch protection or conflict"}` });
+  }
+  if (mr.status === 403) {
+    return json(403, { ok: false, error: "merge forbidden — the App likely lacks contents:write; re-accept the App permission update" });
+  }
+  const j = await mr.json().catch(() => ({})) as { message?: string };
+  return json(502, { ok: false, error: `merge failed (${mr.status})${j.message ? ": " + j.message : ""}` });
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { generateKeyPairSync, createVerify, sign as nodeSign } from "node:crypto";
-import { makeAppJwt, handleExchangeVerify, handleExchangeDeleteBranch, handleAppInstalled, handleAppManifestCallback, callerAuthMessage } from "../src/registry/routes/github-app";
+import { makeAppJwt, handleExchangeVerify, handleExchangeDeleteBranch, handleExchangeMergePR, handleAppInstalled, handleAppManifestCallback, callerAuthMessage } from "../src/registry/routes/github-app";
 
 // The durable-verifier central half. Two hazard-bearing pieces, both credential-
 // free here: (1) the App JWT — if the RS256 signature or the PKCS#1→PKCS#8 wrap
@@ -293,6 +293,107 @@ describe("handleExchangeDeleteBranch", () => {
   it("503 when the App is not registered", async () => {
     delMock();                                           // serves the owner keys for caller-auth
     const r = await handleExchangeDeleteBranch(DELPOST({ repo: "o/r", branch: "claude/x", ...sign("delete-branch", "o/r", "claude/x") }), baseEnv(makeKV()));
+    expect(r.status).toBe(503);
+  });
+});
+
+// A GitHub mock for merge-pr: installation/token, check-runs for the head SHA,
+// and the squash-merge PUT. `checks` drives the green gate; `mergeStatus` the
+// merge outcome.
+const MSHA = "abc1234".padEnd(40, "0"); // 40-hex
+function mergeMock(opts: { installed?: boolean; checks?: Array<{ status: string; conclusion: string | null; name?: string }> | null; mergeStatus?: number } = {}) {
+  const { installed = true, checks = [{ status: "completed", conclusion: "success", name: "worker-unit" }], mergeStatus = 200 } = opts;
+  let mergeCall: { url: string; body: any } | null = null;
+  const fetchMock = vi.fn(async (url: any, init: any = {}) => {
+    const u = String(url);
+    if (/github\.com\/[^/]+\.keys$/.test(u)) return new Response(OWNER_OPENSSH + "\n", { status: 200 });
+    if (/\/repos\/[^?]+\/installation$/.test(u)) {
+      return installed ? new Response(JSON.stringify({ id: 11 }), { status: 200 }) : new Response("", { status: 404 });
+    }
+    if (/\/app\/installations\/[^/]+\/access_tokens$/.test(u) && init.method === "POST") {
+      return new Response(JSON.stringify({ token: "merge-tok" }), { status: 200 });
+    }
+    if (/\/commits\/[0-9a-f]+\/check-runs$/.test(u)) {
+      const arr = checks ?? [];
+      return new Response(JSON.stringify({ total_count: arr.length, check_runs: arr }), { status: 200 });
+    }
+    if (/\/pulls\/\d+\/merge$/.test(u) && init.method === "PUT") {
+      mergeCall = { url: u, body: JSON.parse(init.body) };
+      if (mergeStatus === 200) return new Response(JSON.stringify({ sha: "mergedsha", merged: true }), { status: 200 });
+      return new Response(JSON.stringify({ message: "Pull Request is not mergeable" }), { status: mergeStatus });
+    }
+    return new Response("unexpected", { status: 500 });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  return { getMerge: () => mergeCall };
+}
+const MERGEPOST = (body: unknown) =>
+  new Request("https://known.life/exchange/merge-pr", { method: "POST", headers: { "Content-Type": "application/json", "CF-Connecting-IP": "8.8.8.8" }, body: JSON.stringify(body) });
+const mergeBody = (over: Record<string, unknown> = {}) => ({ repo: "o/r", pr: 497, branch: "claude/feature", sha: MSHA, ...sign("merge-pr", "o/r", MSHA), ...over });
+
+describe("handleExchangeMergePR", () => {
+  it("merges a green claude/* PR, pinned to the gated SHA", async () => {
+    const m = mergeMock();
+    const r = await handleExchangeMergePR(MERGEPOST(mergeBody()), baseEnv());
+    expect(r.status).toBe(200);
+    expect(await r.json()).toMatchObject({ ok: true, merged: true });
+    const mc = m.getMerge()!;
+    expect(mc.body).toMatchObject({ merge_method: "squash", sha: MSHA }); // SHA-pinned, squash
+  });
+  it("pending while a check is still running — no merge", async () => {
+    const m = mergeMock({ checks: [{ status: "in_progress", conclusion: null }] });
+    const r = await handleExchangeMergePR(MERGEPOST(mergeBody()), baseEnv());
+    expect(await r.json()).toMatchObject({ ok: false, pending: true });
+    expect(m.getMerge()).toBeNull(); // never merged with CI in flight
+  });
+  it("pending when zero check-runs have reported yet (race) — no merge", async () => {
+    const m = mergeMock({ checks: [] });
+    const r = await handleExchangeMergePR(MERGEPOST(mergeBody()), baseEnv());
+    expect(await r.json()).toMatchObject({ ok: false, pending: true });
+    expect(m.getMerge()).toBeNull();
+  });
+  it("refuses on a red check (failed) — never merges", async () => {
+    const m = mergeMock({ checks: [{ status: "completed", conclusion: "failure", name: "worker-unit" }] });
+    const r = await handleExchangeMergePR(MERGEPOST(mergeBody()), baseEnv());
+    expect(await r.json()).toMatchObject({ ok: false, failed: true, checks: ["worker-unit"] });
+    expect(m.getMerge()).toBeNull();
+  });
+  it("refuses a non-claude/* head (403, before any GitHub call)", async () => {
+    const m = mergeMock();
+    const r = await handleExchangeMergePR(MERGEPOST(mergeBody({ branch: "main" })), baseEnv());
+    expect(r.status).toBe(403);
+    expect(m.getMerge()).toBeNull();
+  });
+  it("400 on a non-40-hex sha", async () => {
+    const r = await handleExchangeMergePR(MERGEPOST({ repo: "o/r", pr: 1, branch: "claude/x", sha: "deadbeef", ...sign("merge-pr", "o/r", "deadbeef") }), baseEnv());
+    expect(r.status).toBe(400);
+  });
+  it("401 when unsigned — caller-auth before any GitHub call", async () => {
+    const m = mergeMock();
+    const r = await handleExchangeMergePR(MERGEPOST({ repo: "o/r", pr: 497, branch: "claude/feature", sha: MSHA }), baseEnv());
+    expect(r.status).toBe(401);
+    expect(m.getMerge()).toBeNull();
+  });
+  it("401 when the signature is bound to a DIFFERENT sha (no replay onto a moved head)", async () => {
+    mergeMock();
+    const other = "f".repeat(40);
+    const r = await handleExchangeMergePR(MERGEPOST({ repo: "o/r", pr: 497, branch: "claude/feature", sha: MSHA, ...sign("merge-pr", "o/r", other) }), baseEnv());
+    expect(r.status).toBe(401);
+  });
+  it("409 when the head moved since the gate (merge 409) — never lands ungated code", async () => {
+    mergeMock({ mergeStatus: 409 });
+    const r = await handleExchangeMergePR(MERGEPOST(mergeBody()), baseEnv());
+    expect(r.status).toBe(409);
+    expect(await r.json()).toMatchObject({ ok: false });
+  });
+  it("403 surfaces a missing contents:write (App permission not re-accepted)", async () => {
+    mergeMock({ mergeStatus: 403 });
+    const r = await handleExchangeMergePR(MERGEPOST(mergeBody()), baseEnv());
+    expect(r.status).toBe(403);
+  });
+  it("503 when the App is not registered", async () => {
+    mergeMock();
+    const r = await handleExchangeMergePR(MERGEPOST(mergeBody()), baseEnv(makeKV()));
     expect(r.status).toBe(503);
   });
 });
