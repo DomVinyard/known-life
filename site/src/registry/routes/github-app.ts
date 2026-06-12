@@ -1,5 +1,6 @@
 import type { Env } from "../lib/types";
 import { checkRate } from "../lib/ratelimit";
+import { verifyGithubIdentity } from "../lib/lifekey-verify.mjs";
 
 /**
  * /setup/github-app + /exchange/verify — the durable verifier, central half.
@@ -185,6 +186,33 @@ async function installationToken(env: Env, repo: string): Promise<{ token: strin
 const repoOk = (repo: unknown): repo is string =>
   typeof repo === "string" && /^[\w.-]+\/[\w.-]+$/.test(repo) && !repo.split("/").some((p) => p === "." || p === "..");
 
+// ── caller-auth: the vault proves it acts FOR the repo owner ──────────────────
+// /exchange/{verify,delete-branch} are open to the internet; their primitives
+// are neutered but a caller could still spend the central App's GitHub quota (or
+// DoS a public repo's branch reap). We authenticate the caller without a shared
+// secret: the vault signs its request with the OWNER's lifekey
+// (LIFEKEY_PRIVATE_KEY, held in the vault's KV; the public half is on
+// github.com/<owner>.keys), and we verify that signature here against those
+// public keys. No shared secret to leak; works from a fresh .life (the vault
+// holds the owner's key before its first /exchange). The signed message is
+// domain-separated and bound to (repo, subject, ts) so a signature can't be
+// replayed across actions, repos, or — beyond the skew window — time. MUST
+// byte-match the vault signer (secrets gene src/worker.js `callerAuthMessage`).
+const CALLER_AUTH_SKEW_S = 300;
+export function callerAuthMessage(action: string, repo: string, subject: string, ts: number): string {
+  return `known.life/exchange/${action}\n${repo}\n${subject}\n${ts}`;
+}
+async function verifyCaller(action: string, repo: string, subject: string, sig: unknown, ts: unknown): Promise<boolean> {
+  if (typeof sig !== "string" || !sig) return false;
+  if (typeof ts !== "number" || !Number.isFinite(ts)) return false;
+  const now = Math.floor(Date.now() / 1000);
+  if (Math.abs(now - ts) > CALLER_AUTH_SKEW_S) return false;
+  const owner = repo.split("/")[0];
+  const msg = callerAuthMessage(action, repo, subject, ts);
+  const res = await verifyGithubIdentity(owner, msg, sig);
+  return !!res.ok;
+}
+
 // POST /exchange/verify { repo, ref, path, nonce } — the delegated nonce read.
 // The vault calls this instead of holding a GitHub credential itself.
 export async function handleExchangeVerify(req: Request, env: Env): Promise<Response> {
@@ -192,7 +220,7 @@ export async function handleExchangeVerify(req: Request, env: Env): Promise<Resp
   const rl = await checkRate(env, `ghverify:${ip}`, 120, 60);
   if (!rl.ok) return json(429, { ok: false, error: "rate_limited" });
 
-  const body = await req.json().catch(() => null) as { repo?: string; ref?: string; path?: string; nonce?: string } | null;
+  const body = await req.json().catch(() => null) as { repo?: string; ref?: string; path?: string; nonce?: string; sig?: string; ts?: number } | null;
   const repo = body?.repo, ref = body?.ref, path = body?.path, nonce = body?.nonce;
   if (!repoOk(repo) || !ref || !path || !nonce) {
     return json(400, { ok: false, error: "repo, ref, path, nonce required" });
@@ -208,6 +236,12 @@ export async function handleExchangeVerify(req: Request, env: Env): Promise<Resp
   // so it must be confined to the protocol's own throwaway file.
   if (!/^[a-f0-9]{8,}$/.test(nonce) || ref !== `life-bootstrap/${nonce}` || path !== `.life-exchange/${nonce}`) {
     return json(400, { ok: false, error: "ref/path must be the canonical bootstrap location for nonce" });
+  }
+  // Caller-auth BEFORE any GitHub call: an unauthenticated request never spends
+  // the central App's quota. The vault signs (repo, nonce, ts) with the owner's
+  // lifekey; we verify against github.com/<owner>.keys.
+  if (!(await verifyCaller("verify", repo, nonce, body?.sig, body?.ts))) {
+    return json(401, { ok: false, error: "caller auth failed" });
   }
 
   const tok = await installationToken(env, repo);
@@ -263,11 +297,16 @@ export async function handleExchangeDeleteBranch(req: Request, env: Env): Promis
   const rl = await checkRate(env, `ghdelbranch:${ip}`, 60, 60);
   if (!rl.ok) return json(429, { ok: false, error: "rate_limited" });
 
-  const body = await req.json().catch(() => null) as { repo?: string; branch?: string } | null;
+  const body = await req.json().catch(() => null) as { repo?: string; branch?: string; sig?: string; ts?: number } | null;
   const repo = body?.repo, branch = body?.branch;
   if (!repoOk(repo) || typeof branch !== "string" || !branch) return json(400, { ok: false, error: "repo, branch required" });
   if (!DELETABLE_BRANCH.test(branch) || branch.includes("..")) {
     return json(403, { ok: false, error: "refusing: only claude/* or life-bootstrap/* branches are deletable" });
+  }
+  // Caller-auth BEFORE any GitHub call (same scheme as /exchange/verify): the
+  // vault signs (repo, branch, ts) with the owner's lifekey.
+  if (!(await verifyCaller("delete-branch", repo, branch, body?.sig, body?.ts))) {
+    return json(401, { ok: false, error: "caller auth failed" });
   }
 
   const tok = await installationToken(env, repo);

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { generateKeyPairSync, createVerify } from "node:crypto";
-import { makeAppJwt, handleExchangeVerify, handleExchangeDeleteBranch, handleAppInstalled, handleAppManifestCallback } from "../src/registry/routes/github-app";
+import { generateKeyPairSync, createVerify, sign as nodeSign } from "node:crypto";
+import { makeAppJwt, handleExchangeVerify, handleExchangeDeleteBranch, handleAppInstalled, handleAppManifestCallback, callerAuthMessage } from "../src/registry/routes/github-app";
 
 // The durable-verifier central half. Two hazard-bearing pieces, both credential-
 // free here: (1) the App JWT — if the RS256 signature or the PKCS#1→PKCS#8 wrap
@@ -13,6 +13,27 @@ import { makeAppJwt, handleExchangeVerify, handleExchangeDeleteBranch, handleApp
 const kp = generateKeyPairSync("rsa", { modulusLength: 2048 });
 const APP_PKCS1_PEM = kp.privateKey.export({ type: "pkcs1", format: "pem" }) as string;
 const APP_PUB_PEM = kp.publicKey.export({ type: "spki", format: "pem" }) as string;
+
+// ── caller-auth fixtures: the OWNER's lifekey ────────────────────────────────
+// The vault signs /exchange requests with LIFEKEY_PRIVATE_KEY (Ed25519); central
+// verifies the signature against the owner's public keys on github.com. Here we
+// stand up a real Ed25519 keypair, publish its public half as the openssh line
+// github.com/<owner>.keys would serve, and sign messages exactly as the vault
+// does — so this exercises the real verifyGithubIdentity path + message format.
+const owner = generateKeyPairSync("ed25519");
+const OWNER_PRIV = owner.privateKey; // pkcs8, the LIFEKEY_PRIVATE_KEY shape
+// raw 32-byte ed25519 pubkey = last 32 bytes of the spki DER → openssh ssh-ed25519 line
+function sshString(b: Buffer): Buffer {
+  const len = Buffer.alloc(4); len.writeUInt32BE(b.length, 0); return Buffer.concat([len, b]);
+}
+const OWNER_RAW_PUB = owner.publicKey.export({ type: "spki", format: "der" }).subarray(-32);
+const OWNER_OPENSSH = "ssh-ed25519 " +
+  Buffer.concat([sshString(Buffer.from("ssh-ed25519")), sshString(Buffer.from(OWNER_RAW_PUB))]).toString("base64");
+// Sign as the vault would: raw Ed25519 over the canonical message, base64.
+function sign(action: string, repo: string, subject: string, ts = Math.floor(Date.now() / 1000)) {
+  const sig = nodeSign(null, Buffer.from(callerAuthMessage(action, repo, subject, ts)), OWNER_PRIV).toString("base64");
+  return { sig, ts };
+}
 
 function makeKV(seed: Record<string, string> = {}) {
   const m = new Map(Object.entries(seed));
@@ -73,6 +94,7 @@ function ghMock(opts: { installed?: boolean; nonceContent?: string | null } = {}
   let mintedJwt: string | null = null;
   const fetchMock = vi.fn(async (url: any, init: any = {}) => {
     const u = String(url);
+    if (/github\.com\/[^/]+\.keys$/.test(u)) return new Response(OWNER_OPENSSH + "\n", { status: 200 });
     const auth = (init.headers?.Authorization || "").replace(/^Bearer\s+/, "");
     if (/\/repos\/[^?]+\/installation$/.test(u)) {
       mintedJwt = auth;
@@ -110,7 +132,7 @@ describe("handleExchangeVerify", () => {
 
   it("ok:true when the nonce matches, using a freshly minted installation token", async () => {
     const m = ghMock({ nonceContent: NONCE });
-    const r = await handleExchangeVerify(POST({ repo: "o/r", ref: REF, path: PATH, nonce: NONCE }), baseEnv());
+    const r = await handleExchangeVerify(POST({ repo: "o/r", ref: REF, path: PATH, nonce: NONCE, ...sign("verify", "o/r", NONCE) }), baseEnv());
     expect(r.status).toBe(200);
     expect(await r.json()).toMatchObject({ ok: true });
     // the App JWT presented to GitHub verifies against our key
@@ -123,19 +145,20 @@ describe("handleExchangeVerify", () => {
 
   it("ok:false on a nonce mismatch — no false positive (auth bypass guard)", async () => {
     const m = ghMock({ nonceContent: "WRONG" });
-    const r = await handleExchangeVerify(POST({ repo: "o/r", ref: REF, path: PATH, nonce: NONCE }), baseEnv());
+    const r = await handleExchangeVerify(POST({ repo: "o/r", ref: REF, path: PATH, nonce: NONCE, ...sign("verify", "o/r", NONCE) }), baseEnv());
     expect(await r.json()).toMatchObject({ ok: false });
     expect(m.deleted.length).toBe(0); // never reap on a failed verify
   });
 
   it("reports not_installed (not an error) when the App isn't on the repo", async () => {
     ghMock({ installed: false });
-    const r = await handleExchangeVerify(POST({ repo: "o/r", ref: REF, path: PATH, nonce: NONCE }), baseEnv());
+    const r = await handleExchangeVerify(POST({ repo: "o/r", ref: REF, path: PATH, nonce: NONCE, ...sign("verify", "o/r", NONCE) }), baseEnv());
     expect(await r.json()).toMatchObject({ ok: false, reason: "not_installed" });
   });
 
   it("503 when the verifier App is not registered", async () => {
-    const r = await handleExchangeVerify(POST({ repo: "o/r", ref: REF, path: PATH, nonce: NONCE }), baseEnv(makeKV()));
+    ghMock();                                            // serve the owner keys for caller-auth
+    const r = await handleExchangeVerify(POST({ repo: "o/r", ref: REF, path: PATH, nonce: NONCE, ...sign("verify", "o/r", NONCE) }), baseEnv(makeKV()));
     expect(r.status).toBe(503);
   });
 
@@ -167,6 +190,36 @@ describe("handleExchangeVerify", () => {
     const r = await handleExchangeVerify(POST({ repo: "o/r", ref: "life-bootstrap/the-nonce", path: ".life-exchange/the-nonce", nonce: "the-nonce" }), baseEnv());
     expect(r.status).toBe(400);
   });
+
+  // Caller-auth: an internet caller without the owner's lifekey must be turned
+  // away (401) BEFORE any GitHub token is minted — closes the App-quota residual.
+  it("401 when the request is unsigned (no sig/ts) — never mints a token", async () => {
+    const m = ghMock({ nonceContent: NONCE });
+    const r = await handleExchangeVerify(POST({ repo: "o/r", ref: REF, path: PATH, nonce: NONCE }), baseEnv());
+    expect(r.status).toBe(401);
+    expect(m.getJwt()).toBeNull();        // no installation token minted
+    expect(m.deleted.length).toBe(0);
+  });
+  it("401 when the signature is forged with the wrong key", async () => {
+    const m = ghMock({ nonceContent: NONCE });
+    const wrong = generateKeyPairSync("ed25519").privateKey;
+    const ts = Math.floor(Date.now() / 1000);
+    const sig = nodeSign(null, Buffer.from(callerAuthMessage("verify", "o/r", NONCE, ts)), wrong).toString("base64");
+    const r = await handleExchangeVerify(POST({ repo: "o/r", ref: REF, path: PATH, nonce: NONCE, sig, ts }), baseEnv());
+    expect(r.status).toBe(401);
+    expect(m.getJwt()).toBeNull();
+  });
+  it("401 when the timestamp is outside the skew window (replay defense)", async () => {
+    ghMock({ nonceContent: NONCE });
+    const stale = Math.floor(Date.now() / 1000) - 3600;
+    const r = await handleExchangeVerify(POST({ repo: "o/r", ref: REF, path: PATH, nonce: NONCE, ...sign("verify", "o/r", NONCE, stale) }), baseEnv());
+    expect(r.status).toBe(401);
+  });
+  it("401 when a valid sig is bound to a DIFFERENT repo (no cross-repo replay)", async () => {
+    ghMock({ nonceContent: NONCE });
+    const r = await handleExchangeVerify(POST({ repo: "o/r", ref: REF, path: PATH, nonce: NONCE, ...sign("verify", "other/repo", NONCE) }), baseEnv());
+    expect(r.status).toBe(401);
+  });
 });
 
 // A GitHub mock for delete-branch: pulls (merge check), repo (default_branch),
@@ -176,6 +229,7 @@ function delMock(opts: { installed?: boolean; mergedPr?: boolean; aheadBy?: numb
   const deleted: string[] = [];
   const fetchMock = vi.fn(async (url: any, init: any = {}) => {
     const u = String(url);
+    if (/github\.com\/[^/]+\.keys$/.test(u)) return new Response(OWNER_OPENSSH + "\n", { status: 200 });
     if (/\/repos\/[^?]+\/installation$/.test(u)) {
       return installed ? new Response(JSON.stringify({ id: 7 }), { status: 200 }) : new Response("", { status: 404 });
     }
@@ -203,36 +257,42 @@ const DELPOST = (body: unknown) =>
 describe("handleExchangeDeleteBranch", () => {
   it("deletes a scratch life-bootstrap/* branch with no merge check", async () => {
     const m = delMock();
-    const r = await handleExchangeDeleteBranch(DELPOST({ repo: "o/r", branch: "life-bootstrap/aabbccdd" }), baseEnv());
+    const r = await handleExchangeDeleteBranch(DELPOST({ repo: "o/r", branch: "life-bootstrap/aabbccdd", ...sign("delete-branch", "o/r", "life-bootstrap/aabbccdd") }), baseEnv());
     expect(await r.json()).toMatchObject({ ok: true });
     expect(m.deleted.length).toBe(1);
   });
   it("deletes a MERGED claude/* branch (PR merged)", async () => {
     const m = delMock({ mergedPr: true });
-    const r = await handleExchangeDeleteBranch(DELPOST({ repo: "o/r", branch: "claude/done" }), baseEnv());
+    const r = await handleExchangeDeleteBranch(DELPOST({ repo: "o/r", branch: "claude/done", ...sign("delete-branch", "o/r", "claude/done") }), baseEnv());
     expect(await r.json()).toMatchObject({ ok: true });
     expect(m.deleted.length).toBe(1);
   });
   it("refuses an UNMERGED claude/* branch (409, no delete) — never lose work", async () => {
     const m = delMock({ mergedPr: false, aheadBy: 5 });
-    const r = await handleExchangeDeleteBranch(DELPOST({ repo: "o/r", branch: "claude/wip" }), baseEnv());
+    const r = await handleExchangeDeleteBranch(DELPOST({ repo: "o/r", branch: "claude/wip", ...sign("delete-branch", "o/r", "claude/wip") }), baseEnv());
     expect(r.status).toBe(409);
     expect(m.deleted.length).toBe(0);
   });
   it("deletes a claude/* branch with no content change (ahead_by 0)", async () => {
     const m = delMock({ mergedPr: false, aheadBy: 0 });
-    const r = await handleExchangeDeleteBranch(DELPOST({ repo: "o/r", branch: "claude/noise" }), baseEnv());
+    const r = await handleExchangeDeleteBranch(DELPOST({ repo: "o/r", branch: "claude/noise", ...sign("delete-branch", "o/r", "claude/noise") }), baseEnv());
     expect(await r.json()).toMatchObject({ ok: true });
     expect(m.deleted.length).toBe(1);
   });
-  it("refuses a non-deletable ref (403)", async () => {
+  it("refuses a non-deletable ref (403, before caller-auth)", async () => {
     delMock();
     const r = await handleExchangeDeleteBranch(DELPOST({ repo: "o/r", branch: "main" }), baseEnv());
     expect(r.status).toBe(403);
   });
+  it("401 when unsigned — caller-auth before any GitHub call", async () => {
+    const m = delMock();
+    const r = await handleExchangeDeleteBranch(DELPOST({ repo: "o/r", branch: "claude/done" }), baseEnv());
+    expect(r.status).toBe(401);
+    expect(m.deleted.length).toBe(0);
+  });
   it("503 when the App is not registered", async () => {
-    delMock();
-    const r = await handleExchangeDeleteBranch(DELPOST({ repo: "o/r", branch: "claude/x" }), baseEnv(makeKV()));
+    delMock();                                           // serves the owner keys for caller-auth
+    const r = await handleExchangeDeleteBranch(DELPOST({ repo: "o/r", branch: "claude/x", ...sign("delete-branch", "o/r", "claude/x") }), baseEnv(makeKV()));
     expect(r.status).toBe(503);
   });
 });
