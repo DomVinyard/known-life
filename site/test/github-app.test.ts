@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { generateKeyPairSync, createVerify } from "node:crypto";
-import { makeAppJwt, handleExchangeVerify } from "../src/registry/routes/github-app";
+import { makeAppJwt, handleExchangeVerify, handleExchangeDeleteBranch } from "../src/registry/routes/github-app";
 
 // The durable-verifier central half. Two hazard-bearing pieces, both credential-
 // free here: (1) the App JWT — if the RS256 signature or the PKCS#1→PKCS#8 wrap
@@ -77,7 +77,7 @@ function ghMock(opts: { installed?: boolean; nonceContent?: string | null } = {}
     }
     if (/\/git\/refs\/heads\//.test(u) && init.method === "DELETE") {
       deleted.push(u);
-      return new Response("", { status: 204 });
+      return new Response(null, { status: 204 });
     }
     return new Response("unexpected", { status: 500 });
   });
@@ -127,5 +127,73 @@ describe("handleExchangeVerify", () => {
     const r = await handleExchangeVerify(POST({ repo: "o/r", ref: "main", path: "x", nonce: "n" }), baseEnv());
     expect(await r.json()).toMatchObject({ ok: true });
     expect(m.deleted.length).toBe(0);
+  });
+});
+
+// A GitHub mock for delete-branch: pulls (merge check), repo (default_branch),
+// compare, and the ref DELETE.
+function delMock(opts: { installed?: boolean; mergedPr?: boolean; aheadBy?: number } = {}) {
+  const { installed = true, mergedPr = false, aheadBy = 5 } = opts;
+  const deleted: string[] = [];
+  const fetchMock = vi.fn(async (url: any, init: any = {}) => {
+    const u = String(url);
+    if (/\/repos\/[^?]+\/installation$/.test(u)) {
+      return installed ? new Response(JSON.stringify({ id: 7 }), { status: 200 }) : new Response("", { status: 404 });
+    }
+    if (/\/app\/installations\/[^/]+\/access_tokens$/.test(u) && init.method === "POST") {
+      return new Response(JSON.stringify({ token: "del-tok" }), { status: 200 });
+    }
+    if (/\/repos\/[^/]+\/[^/]+\/pulls\?/.test(u)) {
+      return new Response(JSON.stringify(mergedPr ? [{ merged_at: "2026-01-01T00:00:00Z" }] : []), { status: 200 });
+    }
+    if (/\/compare\//.test(u)) {
+      return new Response(JSON.stringify({ ahead_by: aheadBy, files: [{ filename: "x" }], total_commits: 1 }), { status: 200 });
+    }
+    if (/\/repos\/[^/]+\/[^/]+$/.test(u.split("?")[0]) && (init.method ?? "GET") === "GET") {
+      return new Response(JSON.stringify({ default_branch: "main" }), { status: 200 });
+    }
+    if (/\/git\/refs\/heads\//.test(u) && init.method === "DELETE") { deleted.push(u); return new Response(null, { status: 204 }); }
+    return new Response("unexpected", { status: 500 });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  return { deleted };
+}
+const DELPOST = (body: unknown) =>
+  new Request("https://known.life/exchange/delete-branch", { method: "POST", headers: { "Content-Type": "application/json", "CF-Connecting-IP": "9.9.9.9" }, body: JSON.stringify(body) });
+
+describe("handleExchangeDeleteBranch", () => {
+  it("deletes a scratch life-bootstrap/* branch with no merge check", async () => {
+    const m = delMock();
+    const r = await handleExchangeDeleteBranch(DELPOST({ repo: "o/r", branch: "life-bootstrap/aabbccdd" }), baseEnv());
+    expect(await r.json()).toMatchObject({ ok: true });
+    expect(m.deleted.length).toBe(1);
+  });
+  it("deletes a MERGED claude/* branch (PR merged)", async () => {
+    const m = delMock({ mergedPr: true });
+    const r = await handleExchangeDeleteBranch(DELPOST({ repo: "o/r", branch: "claude/done" }), baseEnv());
+    expect(await r.json()).toMatchObject({ ok: true });
+    expect(m.deleted.length).toBe(1);
+  });
+  it("refuses an UNMERGED claude/* branch (409, no delete) — never lose work", async () => {
+    const m = delMock({ mergedPr: false, aheadBy: 5 });
+    const r = await handleExchangeDeleteBranch(DELPOST({ repo: "o/r", branch: "claude/wip" }), baseEnv());
+    expect(r.status).toBe(409);
+    expect(m.deleted.length).toBe(0);
+  });
+  it("deletes a claude/* branch with no content change (ahead_by 0)", async () => {
+    const m = delMock({ mergedPr: false, aheadBy: 0 });
+    const r = await handleExchangeDeleteBranch(DELPOST({ repo: "o/r", branch: "claude/noise" }), baseEnv());
+    expect(await r.json()).toMatchObject({ ok: true });
+    expect(m.deleted.length).toBe(1);
+  });
+  it("refuses a non-deletable ref (403)", async () => {
+    delMock();
+    const r = await handleExchangeDeleteBranch(DELPOST({ repo: "o/r", branch: "main" }), baseEnv());
+    expect(r.status).toBe(403);
+  });
+  it("503 when the App is not registered", async () => {
+    delMock();
+    const r = await handleExchangeDeleteBranch(DELPOST({ repo: "o/r", branch: "claude/x" }), baseEnv(makeKV()));
+    expect(r.status).toBe(503);
   });
 });

@@ -151,6 +151,27 @@ export async function handleAppManifestCallback(req: Request, env: Env): Promise
     `<p>After installing, the vault's durable verifier activates — no token to paste.</p>`));
 }
 
+// Mint an installation token for a repo from the known.life App. Returns the
+// token, or { notInstalled } when the App isn't on the repo, or null on error/
+// not-registered. Shared by /exchange/verify and /exchange/delete-branch.
+async function installationToken(env: Env, repo: string): Promise<{ token: string } | { notInstalled: true } | null> {
+  const appId = await env.KNOWN_KV.get(K_APP_ID);
+  const pem = await env.KNOWN_KV.get(K_APP_PEM);
+  if (!appId || !pem) return null;
+  let jwt: string;
+  try { jwt = await makeAppJwt(appId, pem); } catch { return null; }
+  const inst = await fetch(`${GH}/repos/${repo}/installation`, { headers: ghHeaders(jwt) });
+  if (inst.status === 404) return { notInstalled: true };
+  if (!inst.ok) return null;
+  const installationId = String(((await inst.json()) as { id: number }).id);
+  const tokRes = await fetch(`${GH}/app/installations/${installationId}/access_tokens`, { method: "POST", headers: ghHeaders(jwt) });
+  if (!tokRes.ok) return null;
+  return { token: ((await tokRes.json()) as { token: string }).token };
+}
+
+const repoOk = (repo: unknown): repo is string =>
+  typeof repo === "string" && /^[\w.-]+\/[\w.-]+$/.test(repo) && !repo.split("/").some((p) => p === "." || p === "..");
+
 // POST /exchange/verify { repo, ref, path, nonce } — the delegated nonce read.
 // The vault calls this instead of holding a GitHub credential itself.
 export async function handleExchangeVerify(req: Request, env: Env): Promise<Response> {
@@ -160,28 +181,14 @@ export async function handleExchangeVerify(req: Request, env: Env): Promise<Resp
 
   const body = await req.json().catch(() => null) as { repo?: string; ref?: string; path?: string; nonce?: string } | null;
   const repo = body?.repo, ref = body?.ref, path = body?.path, nonce = body?.nonce;
-  const repoOk = typeof repo === "string" && /^[\w.-]+\/[\w.-]+$/.test(repo) &&
-    !repo.split("/").some((p) => p === "." || p === ".."); // no traversal segments
-  if (!repoOk || !ref || !path || !nonce) {
+  if (!repoOk(repo) || !ref || !path || !nonce) {
     return json(400, { ok: false, error: "repo, ref, path, nonce required" });
   }
 
-  const appId = await env.KNOWN_KV.get(K_APP_ID);
-  const pem = await env.KNOWN_KV.get(K_APP_PEM);
-  if (!appId || !pem) return json(503, { ok: false, error: "verifier app not registered" });
-
-  let jwt: string;
-  try { jwt = await makeAppJwt(appId, pem); } catch { return json(500, { ok: false, error: "jwt" }); }
-
-  // Resolve the installation for this repo (proves the App is installed there).
-  const inst = await fetch(`${GH}/repos/${repo}/installation`, { headers: ghHeaders(jwt) });
-  if (inst.status === 404) return json(200, { ok: false, reason: "not_installed" });
-  if (!inst.ok) return json(502, { ok: false, error: `installation lookup ${inst.status}` });
-  const installationId = String(((await inst.json()) as { id: number }).id);
-
-  const tokRes = await fetch(`${GH}/app/installations/${installationId}/access_tokens`, { method: "POST", headers: ghHeaders(jwt) });
-  if (!tokRes.ok) return json(502, { ok: false, error: `token mint ${tokRes.status}` });
-  const instTok = ((await tokRes.json()) as { token: string }).token;
+  const tok = await installationToken(env, repo);
+  if (tok === null) return json(503, { ok: false, error: "verifier app not registered" });
+  if ("notInstalled" in tok) return json(200, { ok: false, reason: "not_installed" });
+  const instTok = tok.token;
 
   // Read the nonce back. One re-read absorbs GitHub's read-after-write window.
   let ok = false;
@@ -198,6 +205,63 @@ export async function handleExchangeVerify(req: Request, env: Env): Promise<Resp
     await fetch(`${GH}/repos/${repo}/git/refs/heads/${ref}`, { method: "DELETE", headers: ghHeaders(instTok) }).catch(() => {});
   }
   return json(200, { ok });
+}
+
+// POST /exchange/delete-branch { repo, branch } — delete a spent branch a
+// session can't (the harness git proxy 403s ref deletion). The brokered-ops
+// pattern the vault used, with its GitHub credential swapped to the App. Guarded
+// HARD: only merged `claude/*` or scratch `life-bootstrap/*` — unmerged work can
+// never be lost (content-free commit noise can). The merge guard is verbatim
+// from the vault's old handleGitDeleteBranch.
+const DELETABLE_BRANCH = /^(claude|life-bootstrap)\/[A-Za-z0-9._/-]+$/;
+export async function handleExchangeDeleteBranch(req: Request, env: Env): Promise<Response> {
+  const ip = req.headers.get("CF-Connecting-IP") ?? "unknown";
+  const rl = await checkRate(env, `ghdelbranch:${ip}`, 60, 60);
+  if (!rl.ok) return json(429, { ok: false, error: "rate_limited" });
+
+  const body = await req.json().catch(() => null) as { repo?: string; branch?: string } | null;
+  const repo = body?.repo, branch = body?.branch;
+  if (!repoOk(repo) || typeof branch !== "string" || !branch) return json(400, { ok: false, error: "repo, branch required" });
+  if (!DELETABLE_BRANCH.test(branch) || branch.includes("..")) {
+    return json(403, { ok: false, error: "refusing: only claude/* or life-bootstrap/* branches are deletable" });
+  }
+
+  const tok = await installationToken(env, repo);
+  if (tok === null) return json(503, { ok: false, error: "verifier app not registered" });
+  if ("notInstalled" in tok) return json(200, { ok: false, reason: "not_installed" });
+  const gh = (p: string, init?: RequestInit) => fetch(`${GH}/repos/${repo}${p}`, { ...init, headers: { ...ghHeaders(tok.token), ...(init && init.headers) } });
+
+  // Merge guard for claude/* (life-bootstrap/* is throwaway scratch — skip).
+  if (branch.startsWith("claude/")) {
+    const owner = repo.split("/")[0];
+    let merged = false;
+    const prRes = await gh(`/pulls?head=${encodeURIComponent(`${owner}:${branch}`)}&state=all&per_page=100`);
+    if (prRes.ok) {
+      const prs = await prRes.json().catch(() => []) as Array<{ merged_at?: string }>;
+      merged = Array.isArray(prs) && prs.some((pr) => pr && pr.merged_at);
+    }
+    if (!merged) {
+      const repoRes = await gh("");
+      const def = repoRes.ok ? ((await repoRes.json().catch(() => ({}))) as { default_branch?: string }).default_branch : null;
+      if (def) {
+        const cmp = await gh(`/compare/${encodeURIComponent(def)}...${encodeURIComponent(branch)}`);
+        if (cmp.ok) {
+          const c = await cmp.json().catch(() => ({})) as { ahead_by?: number; files?: unknown[]; total_commits?: number };
+          // ahead_by 0: tip already reachable from the default branch. files []:
+          // the branch introduces no content change vs default (stale evolve
+          // noise) — deleting loses commit metadata only, never content.
+          merged = !!c && (c.ahead_by === 0 || (Array.isArray(c.files) && c.files.length === 0 && (c.total_commits ?? 0) <= 250));
+        }
+      }
+    }
+    if (!merged) return json(409, { ok: false, error: "refusing: branch is not merged into the default branch" });
+  }
+
+  const del = await gh(`/git/refs/heads/${branch}`, { method: "DELETE" });
+  const already = del.status === 422; // ref already gone
+  const ok = del.status === 204 || already;
+  if (!ok) return json(502, { ok: false, error: `github delete failed (${del.status})` });
+  return json(200, { ok: true, branch, already_gone: already });
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
