@@ -184,6 +184,18 @@ export async function handleExchangeVerify(req: Request, env: Env): Promise<Resp
   if (!repoOk(repo) || !ref || !path || !nonce) {
     return json(400, { ok: false, error: "repo, ref, path, nonce required" });
   }
+  // Least-privilege: pin the read to the canonical bootstrap location for this
+  // nonce. The vault protocol always writes the nonce to `.life-exchange/<nonce>`
+  // on a `life-bootstrap/<nonce>` branch (nonce = 48 hex from randomHex(24)) and
+  // asks central to read THAT — nothing else. Enforcing it here keeps this
+  // endpoint from being an open content-equality oracle: without the pin any
+  // internet caller could ask central to read an ARBITRARY path/ref on any
+  // App-installed repo and learn whether that file equals a supplied guess.
+  // Central's App token is the only reader (the vault holds no GitHub credential),
+  // so it must be confined to the protocol's own throwaway file.
+  if (!/^[a-f0-9]{8,}$/.test(nonce) || ref !== `life-bootstrap/${nonce}` || path !== `.life-exchange/${nonce}`) {
+    return json(400, { ok: false, error: "ref/path must be the canonical bootstrap location for nonce" });
+  }
 
   const tok = await installationToken(env, repo);
   if (tok === null) return json(503, { ok: false, error: "verifier app not registered" });

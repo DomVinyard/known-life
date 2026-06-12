@@ -86,9 +86,16 @@ function ghMock(opts: { installed?: boolean; nonceContent?: string | null } = {}
 }
 
 describe("handleExchangeVerify", () => {
+  // The canonical bootstrap location the vault protocol uses: nonce is 48 hex
+  // (randomHex(24)); the nonce file is `.life-exchange/<nonce>` on a
+  // `life-bootstrap/<nonce>` branch. central pins the read to exactly this.
+  const NONCE = "aabbccdd11223344";
+  const REF = `life-bootstrap/${NONCE}`;
+  const PATH = `.life-exchange/${NONCE}`;
+
   it("ok:true when the nonce matches, using a freshly minted installation token", async () => {
-    const m = ghMock({ nonceContent: "the-nonce" });
-    const r = await handleExchangeVerify(POST({ repo: "o/r", ref: "life-bootstrap/aabbccdd", path: "x", nonce: "the-nonce" }), baseEnv());
+    const m = ghMock({ nonceContent: NONCE });
+    const r = await handleExchangeVerify(POST({ repo: "o/r", ref: REF, path: PATH, nonce: NONCE }), baseEnv());
     expect(r.status).toBe(200);
     expect(await r.json()).toMatchObject({ ok: true });
     // the App JWT presented to GitHub verifies against our key
@@ -101,32 +108,49 @@ describe("handleExchangeVerify", () => {
 
   it("ok:false on a nonce mismatch — no false positive (auth bypass guard)", async () => {
     const m = ghMock({ nonceContent: "WRONG" });
-    const r = await handleExchangeVerify(POST({ repo: "o/r", ref: "life-bootstrap/aabbccdd", path: "x", nonce: "the-nonce" }), baseEnv());
+    const r = await handleExchangeVerify(POST({ repo: "o/r", ref: REF, path: PATH, nonce: NONCE }), baseEnv());
     expect(await r.json()).toMatchObject({ ok: false });
     expect(m.deleted.length).toBe(0); // never reap on a failed verify
   });
 
   it("reports not_installed (not an error) when the App isn't on the repo", async () => {
     ghMock({ installed: false });
-    const r = await handleExchangeVerify(POST({ repo: "o/r", ref: "life-bootstrap/aabbccdd", path: "x", nonce: "n" }), baseEnv());
+    const r = await handleExchangeVerify(POST({ repo: "o/r", ref: REF, path: PATH, nonce: NONCE }), baseEnv());
     expect(await r.json()).toMatchObject({ ok: false, reason: "not_installed" });
   });
 
   it("503 when the verifier App is not registered", async () => {
-    const r = await handleExchangeVerify(POST({ repo: "o/r", ref: "r", path: "x", nonce: "n" }), baseEnv(makeKV()));
+    const r = await handleExchangeVerify(POST({ repo: "o/r", ref: REF, path: PATH, nonce: NONCE }), baseEnv(makeKV()));
     expect(r.status).toBe(503);
   });
 
   it("400 on a malformed repo (no path traversal / injection)", async () => {
-    const r = await handleExchangeVerify(POST({ repo: "../etc", ref: "r", path: "x", nonce: "n" }), baseEnv());
+    const r = await handleExchangeVerify(POST({ repo: "../etc", ref: REF, path: PATH, nonce: NONCE }), baseEnv());
     expect(r.status).toBe(400);
   });
 
-  it("does NOT reap a non-bootstrap ref even on a match (scoped deletion)", async () => {
-    const m = ghMock({ nonceContent: "n" });
-    const r = await handleExchangeVerify(POST({ repo: "o/r", ref: "main", path: "x", nonce: "n" }), baseEnv());
-    expect(await r.json()).toMatchObject({ ok: true });
+  // The oracle guard: central must read ONLY the canonical bootstrap file for
+  // the nonce, never an arbitrary path/ref — otherwise it leaks whether any file
+  // in an App-installed repo equals a guess. Each off-protocol request is a 400
+  // with no GitHub call at all (the App token is never even minted).
+  it("rejects an arbitrary path on a valid bootstrap ref (closes the content oracle)", async () => {
+    const m = ghMock({ nonceContent: NONCE });
+    const r = await handleExchangeVerify(POST({ repo: "o/r", ref: REF, path: ".env", nonce: NONCE }), baseEnv());
+    expect(r.status).toBe(400);
+    expect(m.getJwt()).toBeNull(); // never minted a token, never read GitHub
+  });
+
+  it("rejects a non-bootstrap ref (400, no read, no reap)", async () => {
+    const m = ghMock({ nonceContent: NONCE });
+    const r = await handleExchangeVerify(POST({ repo: "o/r", ref: "main", path: PATH, nonce: NONCE }), baseEnv());
+    expect(r.status).toBe(400);
+    expect(m.getJwt()).toBeNull();
     expect(m.deleted.length).toBe(0);
+  });
+
+  it("rejects a non-hex nonce (400)", async () => {
+    const r = await handleExchangeVerify(POST({ repo: "o/r", ref: "life-bootstrap/the-nonce", path: ".life-exchange/the-nonce", nonce: "the-nonce" }), baseEnv());
+    expect(r.status).toBe(400);
   });
 });
 
