@@ -53,6 +53,7 @@ import {
   handleAppManifestCallback,
   handleExchangeVerify,
   handleExchangeDeleteBranch,
+  handleAppInstalled,
 } from "./routes/github-app";
 import { handleSkill } from "./routes/skill";
 import { isValidName } from "./lib/id";
@@ -109,6 +110,7 @@ export async function registryFetch(
   if (path === "/setup/github-app/callback" && method === "GET") return handleAppManifestCallback(req, env);
   if (path === "/exchange/verify" && method === "POST") return handleExchangeVerify(req, env);
   if (path === "/exchange/delete-branch" && method === "POST") return handleExchangeDeleteBranch(req, env);
+  if (path === "/exchange/installed" && method === "GET") return handleAppInstalled(req, env);
 
   // --- agent-driven setup: CF drop-box + redeem ---
   if (path === "/api/setup/cf-drop" && method === "POST") return handleCreateCfDrop(req, env);

@@ -207,6 +207,22 @@ export async function handleExchangeVerify(req: Request, env: Env): Promise<Resp
   return json(200, { ok });
 }
 
+// GET /exchange/installed?repo=<owner/repo> → { installed, install_url } — the
+// onboarding gate. A fresh .life's vault is delegation-only, so it can't verify
+// until the known.life App is installed on its repo, and only the repo owner can
+// grant that (one consent tap). `setup` polls this until installed; `install_url`
+// is the one-tap link to surface.
+export async function handleAppInstalled(req: Request, env: Env): Promise<Response> {
+  const repo = new URL(req.url).searchParams.get("repo");
+  const slug = await env.KNOWN_KV.get(K_APP_SLUG);
+  const install_url = slug ? `https://github.com/apps/${slug}/installations/new` : null;
+  if (!install_url) return json(503, { installed: false, error: "verifier app not registered", install_url });
+  if (!repoOk(repo)) return json(400, { installed: false, error: "repo required (owner/repo)", install_url });
+  const tok = await installationToken(env, repo);
+  const installed = tok !== null && !("notInstalled" in tok);
+  return json(200, { installed, install_url });
+}
+
 // POST /exchange/delete-branch { repo, branch } — delete a spent branch a
 // session can't (the harness git proxy 403s ref deletion). The brokered-ops
 // pattern the vault used, with its GitHub credential swapped to the App. Guarded

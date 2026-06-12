@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { generateKeyPairSync, createVerify } from "node:crypto";
-import { makeAppJwt, handleExchangeVerify, handleExchangeDeleteBranch } from "../src/registry/routes/github-app";
+import { makeAppJwt, handleExchangeVerify, handleExchangeDeleteBranch, handleAppInstalled } from "../src/registry/routes/github-app";
 
 // The durable-verifier central half. Two hazard-bearing pieces, both credential-
 // free here: (1) the App JWT — if the RS256 signature or the PKCS#1→PKCS#8 wrap
@@ -23,7 +23,7 @@ function makeKV(seed: Record<string, string> = {}) {
     _m: m,
   } as any;
 }
-const baseEnv = (kv = makeKV({ "ghapp:id": "424242", "ghapp:pem": APP_PKCS1_PEM })) =>
+const baseEnv = (kv = makeKV({ "ghapp:id": "424242", "ghapp:pem": APP_PKCS1_PEM, "ghapp:slug": "known-life-verifier" })) =>
   ({ KNOWN_KV: kv, PUBLIC_URL: "https://known.life" } as any);
 
 const POST = (body: unknown) =>
@@ -195,5 +195,30 @@ describe("handleExchangeDeleteBranch", () => {
     delMock();
     const r = await handleExchangeDeleteBranch(DELPOST({ repo: "o/r", branch: "claude/x" }), baseEnv(makeKV()));
     expect(r.status).toBe(503);
+  });
+});
+
+describe("handleAppInstalled (onboarding gate)", () => {
+  const GET = (repo) => new Request(`https://known.life/exchange/installed${repo !== undefined ? `?repo=${repo}` : ""}`);
+  it("installed:true + install_url when the App is on the repo", async () => {
+    ghMock({ installed: true });
+    const r = await handleAppInstalled(GET("o/r"), baseEnv());
+    const j = await r.json();
+    expect(r.status).toBe(200);
+    expect(j.installed).toBe(true);
+    expect(j.install_url).toBe("https://github.com/apps/known-life-verifier/installations/new");
+  });
+  it("installed:false (+ the install link) when the App is NOT on the repo", async () => {
+    ghMock({ installed: false });
+    const j = await (await handleAppInstalled(GET("o/r"), baseEnv())).json();
+    expect(j.installed).toBe(false);
+    expect(j.install_url).toContain("/installations/new");
+  });
+  it("400 without a repo", async () => {
+    ghMock({ installed: true });
+    expect((await handleAppInstalled(GET(undefined), baseEnv())).status).toBe(400);
+  });
+  it("503 when the App is not registered", async () => {
+    expect((await handleAppInstalled(GET("o/r"), baseEnv(makeKV()))).status).toBe(503);
   });
 });
