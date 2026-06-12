@@ -133,6 +133,19 @@ export async function handleAppManifestCallback(req: Request, env: Env): Promise
   if (!seen) return htmlResp(400, page("Expired", "That registration link expired — start again at /setup/github-app."));
   await env.KNOWN_KV.delete(K_STATE(state));
 
+  // Never overwrite an existing registration. The App private key is the single
+  // central credential behind every .life's /exchange; silently replacing it
+  // (a leaked/raced state token, or a fresh registration after KV churn) would
+  // hijack or DoS the verifier for all .lifes. Registration is one-time; rotation
+  // must be an explicit, deliberate operator op, never a callback side effect.
+  // Checked BEFORE the manifest conversion so a refused attempt makes no GitHub call.
+  const alreadyRegistered = await env.KNOWN_KV.get(K_APP_SLUG);
+  if (alreadyRegistered) {
+    return htmlResp(409, page("Already registered",
+      `The known.life verifier App <code>${esc(alreadyRegistered)}</code> is already registered. ` +
+      `Refusing to overwrite the central App credential. Rotation is a deliberate operator action.`));
+  }
+
   const r = await fetch(`${GH}/app-manifests/${encodeURIComponent(code)}/conversions`, {
     method: "POST",
     headers: { Accept: "application/vnd.github+json", "User-Agent": "known-life-verifier" },
@@ -225,6 +238,9 @@ export async function handleExchangeVerify(req: Request, env: Env): Promise<Resp
 // grant that (one consent tap). `setup` polls this until installed; `install_url`
 // is the one-tap link to surface.
 export async function handleAppInstalled(req: Request, env: Env): Promise<Response> {
+  const ip = req.headers.get("CF-Connecting-IP") ?? "unknown";
+  const rl = await checkRate(env, `ghinstalled:${ip}`, 120, 60);
+  if (!rl.ok) return json(429, { installed: false, error: "rate_limited" });
   const repo = new URL(req.url).searchParams.get("repo");
   const slug = await env.KNOWN_KV.get(K_APP_SLUG);
   const install_url = slug ? `https://github.com/apps/${slug}/installations/new` : null;

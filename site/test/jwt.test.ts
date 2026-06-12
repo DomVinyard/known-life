@@ -15,7 +15,7 @@ import {
 // origin/expiry/cross-kind path is rejected.
 
 const env = (over: Record<string, string> = {}) =>
-  ({ JWT_SIGNING_KEY: "test-signing-key-deterministic", PUBLIC_URL: "https://known.life", ...over }) as any;
+  ({ JWT_SIGNING_KEY: "test-signing-key-deterministic-0123456789abcdef", PUBLIC_URL: "https://known.life", ...over }) as any;
 
 const SUB = "github:octocat";
 
@@ -26,8 +26,18 @@ describe("registry bearer — issue/verify round-trip", () => {
   });
 
   it("rejects a token signed with a different signing key", async () => {
-    const tok = await issueRegistryToken(SUB, env({ JWT_SIGNING_KEY: "key-A" }));
-    expect(await verifyToken(tok, env({ JWT_SIGNING_KEY: "key-B" }))).toBeNull();
+    const tok = await issueRegistryToken(SUB, env({ JWT_SIGNING_KEY: "key-A-padded-to-at-least-thirty-two-bytes-aaaa" }));
+    expect(await verifyToken(tok, env({ JWT_SIGNING_KEY: "key-B-padded-to-at-least-thirty-two-bytes-bbbb" }))).toBeNull();
+  });
+
+  it("fails CLOSED with no signing key — verify returns null, issue throws (no insecure fallback)", async () => {
+    const noKey = { PUBLIC_URL: "https://known.life" } as any;
+    // A real token, but verified in an env with no key → must not validate.
+    const tok = await issueRegistryToken(SUB, env());
+    expect(await verifyToken(tok, noKey)).toBeNull();
+    await expect(issueRegistryToken(SUB, noKey)).rejects.toThrow(/JWT_SIGNING_KEY/);
+    // A too-short key is also refused (the old code zero-padded it — insecure).
+    await expect(issueRegistryToken(SUB, env({ JWT_SIGNING_KEY: "short" }))).rejects.toThrow(/under 32 bytes/);
   });
 
   it("rejects a token minted for a different origin (issuer/audience bound)", async () => {
@@ -51,11 +61,12 @@ describe("registry bearer — issue/verify round-trip", () => {
     }
   });
 
-  it("round-trips under the built-in dev defaults when env is unset", async () => {
-    // getKey/origin fall back to a dev key + https://known.life; a token minted
-    // and verified under the same (empty) env must still round-trip.
+  it("refuses to mint under an empty env — no insecure dev-key fallback", async () => {
+    // There is deliberately NO fallback signing key. A deploy that forgets
+    // JWT_SIGNING_KEY fails closed (mint throws, verify returns null) rather
+    // than silently signing with a constant anyone could forge against.
     const empty = {} as any;
-    expect(await verifyToken(await issueRegistryToken(SUB, empty), empty)).toBe(SUB);
+    await expect(issueRegistryToken(SUB, empty)).rejects.toThrow(/JWT_SIGNING_KEY/);
   });
 
   it("exposes the SSO cookie name and TTL", () => {

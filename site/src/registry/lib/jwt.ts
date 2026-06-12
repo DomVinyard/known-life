@@ -14,10 +14,18 @@ import type { Env } from "./types";
 const TOKEN_TTL_SECONDS = 60 * 60; // 1 hour — re-auth is a cheap lifekey signature
 
 async function getKey(env: Env): Promise<Uint8Array> {
-  const raw = env.JWT_SIGNING_KEY ?? "dev-only-insecure-key-set-JWT_SIGNING_KEY-in-production";
-  const out = new Uint8Array(32);
-  out.set(new TextEncoder().encode(raw).slice(0, 32));
-  return out;
+  // Fail CLOSED: no in-repo fallback key. A fallback constant in a public repo
+  // means any deploy that forgets to set JWT_SIGNING_KEY (a self-host, a
+  // misconfigured redeploy) is silently forgeable — anyone knowing the constant
+  // could mint a bearer for any github:<login>, incl. an admin. Refuse to
+  // sign/verify without a real ≥32-byte key instead. verifyToken catches this
+  // and returns null (→ 401), so a missing key locks the surface, never opens it.
+  const raw = env.JWT_SIGNING_KEY;
+  const bytes = raw ? new TextEncoder().encode(raw) : new Uint8Array(0);
+  if (bytes.length < 32) {
+    throw new Error("JWT_SIGNING_KEY missing or under 32 bytes — refusing to mint/verify tokens with a weak key");
+  }
+  return bytes.slice(0, 32);
 }
 
 function origin(env: Env): string {

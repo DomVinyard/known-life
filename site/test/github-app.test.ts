@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { generateKeyPairSync, createVerify } from "node:crypto";
-import { makeAppJwt, handleExchangeVerify, handleExchangeDeleteBranch, handleAppInstalled } from "../src/registry/routes/github-app";
+import { makeAppJwt, handleExchangeVerify, handleExchangeDeleteBranch, handleAppInstalled, handleAppManifestCallback } from "../src/registry/routes/github-app";
 
 // The durable-verifier central half. Two hazard-bearing pieces, both credential-
 // free here: (1) the App JWT — if the RS256 signature or the PKCS#1→PKCS#8 wrap
@@ -34,6 +34,21 @@ const POST = (body: unknown) =>
   });
 
 afterEach(() => vi.restoreAllMocks());
+
+describe("handleAppManifestCallback — App-credential overwrite guard", () => {
+  it("refuses to overwrite an already-registered App (409, no GitHub call, creds intact)", async () => {
+    const kv = makeKV({ "ghapp:id": "424242", "ghapp:pem": APP_PKCS1_PEM, "ghapp:slug": "known-life-verifier", "ghapp:state:abc": "1" });
+    const env = { KNOWN_KV: kv, PUBLIC_URL: "https://known.life" } as any;
+    const fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+    const r = await handleAppManifestCallback(
+      new Request("https://known.life/setup/github-app/callback?code=xyz&state=abc"), env);
+    expect(r.status).toBe(409);                          // refused
+    expect(fetchSpy).not.toHaveBeenCalled();             // no manifest conversion attempted
+    expect(await kv.get("ghapp:id")).toBe("424242");     // central App credential untouched
+    expect(await kv.get("ghapp:state:abc")).toBeNull();  // state still consumed (single-use)
+  });
+});
 
 describe("makeAppJwt", () => {
   it("signs a valid RS256 JWT verifiable against the App public key (PKCS#1 import correct)", async () => {
