@@ -36,6 +36,7 @@ import {
   handleProtectedResourceMetadata,
   handleAuthorizationServerMetadata,
   handleAuthorize,
+  handleConsent,
   handleGithubCallback,
   handleDeviceCode,
   handleToken,
@@ -96,6 +97,7 @@ export async function registryFetch(
   if (path === "/.well-known/oauth-authorization-server" && method === "GET")
     return handleAuthorizationServerMetadata(req, env);
   if (path === "/api/oauth/authorize" && method === "GET") return handleAuthorize(req, env);
+  if (path === "/api/oauth/consent" && method === "POST") return handleConsent(req, env);
   if (path === "/api/oauth/github-callback" && method === "GET") return handleGithubCallback(req, env);
   if (path === "/api/oauth/device-code" && method === "POST") return handleDeviceCode(req, env);
   if (path === "/api/oauth/token" && method === "POST") return handleToken(req, env);

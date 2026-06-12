@@ -115,8 +115,29 @@ export async function handleAuthorize(req: Request, env: Env): Promise<Response>
   const prompt = (q.get("prompt") || "").trim();
   const ssoSubject = await readSsoSubject(req, env);
   if (ssoSubject) {
-    const code = await mintAuthCode(ssoSubject, { redirect_uri, code_challenge, code_challenge_method: "S256" }, env);
-    return Response.redirect(clientRedirect(redirect_uri, code, state), 302);
+    // SSO present. Minting a code for redirect_uri and bouncing it there hands
+    // whoever controls that origin a bearer for THIS user. A same-origin or
+    // localhost target is safe (it's us, or the user's own machine); an external
+    // origin is only safe once the user has consented to it. Without this gate a
+    // lured SSO'd victim clicking a crafted /authorize?redirect_uri=https://evil…
+    // link silently leaks a code to the attacker (open-redirect → bearer).
+    const target = new URL(redirect_uri).origin;
+    const trusted = isSilentTrusted(redirect_uri, serverOrigin(req, env))
+      || (await env.KNOWN_KV.get(`oauth-consent:${ssoSubject}:${target}`)) !== null;
+    if (trusted) {
+      const code = await mintAuthCode(ssoSubject, { redirect_uri, code_challenge, code_challenge_method: "S256" }, env);
+      return Response.redirect(clientRedirect(redirect_uri, code, state), 302);
+    }
+    if (prompt === "none") {
+      // Client asked for silent-only but this external origin isn't consented yet
+      // → standard interaction_required so the client surfaces an interactive run.
+      const err = new URL(redirect_uri);
+      err.searchParams.set("error", "interaction_required");
+      if (state) err.searchParams.set("state", state);
+      return Response.redirect(err.toString(), 302);
+    }
+    // First time this user is sent to an external origin — ask once, remember after.
+    return renderConsent(env, { client_id, redirect_uri, state, code_challenge, subject: ssoSubject });
   }
   // No SSO session and the client asked for silent-only → standard OIDC error,
   // so the client can fall back to an interactive login. (RFC: login_required.)
@@ -471,6 +492,95 @@ function isAcceptableRedirect(uri: string): boolean {
   } catch {
     return false;
   }
+}
+
+// --- silent-SSO trust + one-time consent (open-redirect → bearer defense) ---
+
+// A redirect target safe to mint for WITHOUT consent: same-origin as us (it's
+// known.life itself) or a loopback address (the code lands on the user's own
+// machine, unreachable by a remote attacker). Every other origin must be
+// consented once before silent SSO will mint a code for it.
+function isSilentTrusted(redirectUri: string, server: string): boolean {
+  try {
+    const u = new URL(redirectUri);
+    if (u.origin === new URL(server).origin) return true;
+    return u.hostname === "localhost" || u.hostname === "127.0.0.1" || u.hostname === "::1";
+  } catch {
+    return false;
+  }
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
+}
+
+function htmlPage(status: number, body: string): Response {
+  return new Response(`<!doctype html><meta charset=utf-8>${body}`, {
+    status,
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      // The consent click must be deliberate — never framed/clickjacked.
+      "X-Frame-Options": "DENY",
+      "Content-Security-Policy": "frame-ancestors 'none'",
+      "Referrer-Policy": "no-referrer",
+    },
+  });
+}
+
+interface ConsentReq {
+  client_id: string;
+  redirect_uri: string;
+  state: string | null;
+  code_challenge: string;
+  subject: string;
+}
+
+// Render the one-time consent interstitial for a not-yet-trusted external origin.
+async function renderConsent(env: Env, r: ConsentReq): Promise<Response> {
+  const token = randomToken(24);
+  await env.KNOWN_KV.put(`oauth-consent-req:${token}`, JSON.stringify(r), { expirationTtl: STATE_TTL_S });
+  const origin = escapeHtml(new URL(r.redirect_uri).origin);
+  const login = escapeHtml(r.subject.replace(/^github:/, ""));
+  return htmlPage(200, `<title>Sign in · known.life</title>
+<body style="font-family:system-ui;max-width:32rem;margin:4rem auto;padding:0 1rem;line-height:1.55">
+<h1>Sign in to a site</h1>
+<p><strong>${origin}</strong> wants to sign you in as <strong>@${login}</strong> using your known.life identity.</p>
+<p>Approving lets this site act as you on known.life. Only approve if you recognise it.</p>
+<form method="post" action="/api/oauth/consent" style="display:flex;gap:.75rem;margin-top:1.5rem">
+  <input type="hidden" name="token" value="${escapeHtml(token)}">
+  <button name="decision" value="approve" type="submit" style="font-size:1rem;padding:.5rem 1rem">Approve ${origin}</button>
+  <button name="decision" value="deny" type="submit" style="font-size:1rem;padding:.5rem 1rem">Deny</button>
+</form>
+</body>`);
+}
+
+// POST /api/oauth/consent — the user's decision on the interstitial above.
+// Approving remembers the origin for this user (silent thereafter); denying
+// bounces back with access_denied. Re-checks the SSO cookie so only the very
+// identity the interstitial named can approve.
+export async function handleConsent(req: Request, env: Env): Promise<Response> {
+  const form = new URLSearchParams(await req.text());
+  const token = (form.get("token") || "").trim();
+  const decision = form.get("decision");
+  if (!token) return badRequest("missing consent token");
+  const raw = await env.KNOWN_KV.get(`oauth-consent-req:${token}`);
+  if (!raw) return badRequest("consent request expired — start sign-in again");
+  await env.KNOWN_KV.delete(`oauth-consent-req:${token}`); // single-use
+  const r: ConsentReq = JSON.parse(raw);
+
+  const subject = await readSsoSubject(req, env);
+  if (!subject || subject !== r.subject) return badRequest("sign-in session changed — start again");
+
+  if (decision !== "approve") {
+    const err = new URL(r.redirect_uri);
+    err.searchParams.set("error", "access_denied");
+    if (r.state) err.searchParams.set("state", r.state);
+    return Response.redirect(err.toString(), 302);
+  }
+  const target = new URL(r.redirect_uri).origin;
+  await env.KNOWN_KV.put(`oauth-consent:${subject}:${target}`, "1", { expirationTtl: 90 * 24 * 60 * 60 });
+  const code = await mintAuthCode(subject, { redirect_uri: r.redirect_uri, code_challenge: r.code_challenge, code_challenge_method: "S256" }, env);
+  return Response.redirect(clientRedirect(r.redirect_uri, code, r.state), 302);
 }
 
 function json(status: number, data: unknown): Response {
