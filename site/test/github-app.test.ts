@@ -1,6 +1,13 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { generateKeyPairSync, createVerify, sign as nodeSign } from "node:crypto";
-import { makeAppJwt, handleExchangeVerify, handleExchangeDeleteBranch, handleExchangeMergePR, handleAppInstalled, handleAppManifestCallback, callerAuthMessage } from "../src/registry/routes/github-app";
+
+// /exchange/enroll authenticates the enroller via a known.life JWT (lib/jwt
+// verifyToken). Mock it so a test can stand in a proven github:<login> subject
+// without minting a real signed token.
+const { verifyTokenMock } = vi.hoisted(() => ({ verifyTokenMock: vi.fn() }));
+vi.mock("../src/registry/lib/jwt", () => ({ verifyToken: verifyTokenMock }));
+
+import { makeAppJwt, handleExchangeVerify, handleExchangeDeleteBranch, handleExchangeMergePR, handleAppInstalled, handleAppManifestCallback, handleExchangeEnroll, callerAuthMessage } from "../src/registry/routes/github-app";
 
 // The durable-verifier central half. Two hazard-bearing pieces, both credential-
 // free here: (1) the App JWT — if the RS256 signature or the PKCS#1→PKCS#8 wrap
@@ -88,14 +95,16 @@ describe("makeAppJwt", () => {
 });
 
 // A GitHub mock: installation lookup, token mint, nonce read, ref delete.
-function ghMock(opts: { installed?: boolean; nonceContent?: string | null } = {}) {
-  const { installed = true, nonceContent = null } = opts;
+// `ownerKeys` is what github.com/<owner>.keys serves — default the owner's lifekey
+// line; pass "" to simulate an ORG (orgs serve a 200 but empty `.keys`).
+function ghMock(opts: { installed?: boolean; nonceContent?: string | null; ownerKeys?: string } = {}) {
+  const { installed = true, nonceContent = null, ownerKeys = OWNER_OPENSSH } = opts;
   const deleted: string[] = [];
   let mintedJwt: string | null = null;
   let mintBody: any = null;
   const fetchMock = vi.fn(async (url: any, init: any = {}) => {
     const u = String(url);
-    if (/github\.com\/[^/]+\.keys$/.test(u)) return new Response(OWNER_OPENSSH + "\n", { status: 200 });
+    if (/github\.com\/[^/]+\.keys$/.test(u)) return new Response(ownerKeys ? ownerKeys + "\n" : "", { status: 200 });
     const auth = (init.headers?.Authorization || "").replace(/^Bearer\s+/, "");
     if (/\/repos\/[^?]+\/installation$/.test(u)) {
       mintedJwt = auth;
@@ -403,5 +412,173 @@ describe("handleAppInstalled (onboarding gate)", () => {
   });
   it("503 when the App is not registered", async () => {
     expect((await handleAppInstalled(GET("o/r"), baseEnv(makeKV()))).status).toBe(503);
+  });
+});
+
+// ── the org-owned-.life fix: caller-auth resolves the lifekey by an ENROLLED
+// pubkey keyed by repo (K_LIFEKEY), not only github.com/<owner>.keys. This is what
+// lets an org repo verify at all (orgs serve an empty `.keys`), and makes user
+// repos robust to the owner removing their lifekey from GitHub.
+const APP_SEED = { "ghapp:id": "424242", "ghapp:pem": APP_PKCS1_PEM, "ghapp:slug": "known-life-verifier" };
+describe("verifyCaller — enrolled-key path (org-owned .life support)", () => {
+  const NONCE = "deadbeefcafe0123";
+  const REF = `life-bootstrap/${NONCE}`;
+  const PATH = `.life-exchange/${NONCE}`;
+  const vpost = (repo: string) => POST({ repo, ref: REF, path: PATH, nonce: NONCE, ...sign("verify", repo, NONCE) });
+
+  it("verifies an ORG-owned repo via the enrolled key when github.com/<owner>.keys is empty", async () => {
+    const kv = makeKV({ ...APP_SEED, "lifekey:pub:org/r": OWNER_OPENSSH });
+    ghMock({ nonceContent: NONCE, ownerKeys: "" }); // org: 200 but no keys
+    const r = await handleExchangeVerify(vpost("org/r"), { KNOWN_KV: kv, PUBLIC_URL: "https://known.life" } as any);
+    expect(r.status).toBe(200);
+    expect(await r.json()).toMatchObject({ ok: true });
+  });
+
+  it("401 for an org repo with NO enrolled key — empty .keys can't authenticate (the gap, unfixed without enrol)", async () => {
+    const m = ghMock({ nonceContent: NONCE, ownerKeys: "" });
+    const r = await handleExchangeVerify(vpost("org/r"), baseEnv());
+    expect(r.status).toBe(401);
+    expect(m.getJwt()).toBeNull(); // never minted a token — auth fails before any GitHub call
+  });
+
+  it("opportunistically enrols the matched lifekey on a github.com/<owner>.keys verify", async () => {
+    const kv = makeKV({ ...APP_SEED });
+    ghMock({ nonceContent: NONCE });
+    expect(await kv.get("lifekey:pub:o/r")).toBeNull();
+    const r = await handleExchangeVerify(vpost("o/r"), { KNOWN_KV: kv, PUBLIC_URL: "https://known.life" } as any);
+    expect(await r.json()).toMatchObject({ ok: true });
+    expect((await kv.get("lifekey:pub:o/r"))?.trim()).toBe(OWNER_OPENSSH); // pinned for next boot
+  });
+
+  it("re-enrols on a lifekey rotation: a stale stored key fails, falls back to .keys, then is overwritten", async () => {
+    const old = generateKeyPairSync("ed25519");
+    const OLD_RAW = old.publicKey.export({ type: "spki", format: "der" }).subarray(-32);
+    const OLD_OPENSSH = "ssh-ed25519 " +
+      Buffer.concat([sshString(Buffer.from("ssh-ed25519")), sshString(Buffer.from(OLD_RAW))]).toString("base64");
+    const kv = makeKV({ ...APP_SEED, "lifekey:pub:o/r": OLD_OPENSSH }); // stale enrolled key
+    ghMock({ nonceContent: NONCE });                                    // current key on .keys
+    const r = await handleExchangeVerify(vpost("o/r"), { KNOWN_KV: kv, PUBLIC_URL: "https://known.life" } as any);
+    expect(await r.json()).toMatchObject({ ok: true });
+    expect((await kv.get("lifekey:pub:o/r"))?.trim()).toBe(OWNER_OPENSSH); // overwritten with the current key
+  });
+
+  it("401 when a forged sig is offered against a stored key (no false positive on the enrolled path)", async () => {
+    const kv = makeKV({ ...APP_SEED, "lifekey:pub:org/r": OWNER_OPENSSH });
+    const m = ghMock({ nonceContent: NONCE, ownerKeys: "" });
+    const wrong = generateKeyPairSync("ed25519").privateKey;
+    const ts = Math.floor(Date.now() / 1000);
+    const sig = nodeSign(null, Buffer.from(callerAuthMessage("verify", "org/r", NONCE, ts)), wrong).toString("base64");
+    const r = await handleExchangeVerify(
+      POST({ repo: "org/r", ref: REF, path: PATH, nonce: NONCE, sig, ts }),
+      { KNOWN_KV: kv, PUBLIC_URL: "https://known.life" } as any);
+    expect(r.status).toBe(401);
+    expect(m.getJwt()).toBeNull();
+  });
+});
+
+// ── POST /exchange/enroll — store the .life's lifekey pubkey, gated on a proven
+// GitHub identity (JWT) + push access to the repo (the enroller's own token).
+function enrollMock(opts: { push?: boolean; repoOk?: boolean } = {}) {
+  const { push = true, repoOk = true } = opts;
+  const calls: string[] = [];
+  const fetchMock = vi.fn(async (url: any) => {
+    const u = String(url);
+    calls.push(u);
+    if (/\/repos\/[^/]+\/[^/]+$/.test(u.split("?")[0])) {
+      return repoOk
+        ? new Response(JSON.stringify({ permissions: { push } }), { status: 200 })
+        : new Response("Not Found", { status: 404 });
+    }
+    return new Response("unexpected", { status: 500 });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  return { calls };
+}
+const ENROLLPOST = (body: unknown, token: string | null = "jwt-abc") =>
+  new Request("https://known.life/exchange/enroll", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "CF-Connecting-IP": "5.5.5.5",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify(body),
+  });
+
+describe("handleExchangeEnroll", () => {
+  const enrollEnv = (seed: Record<string, string> = { "gh:tok:domvinyard": JSON.stringify({ token: "ght" }) }) =>
+    ({ KNOWN_KV: makeKV(seed), PUBLIC_URL: "https://known.life" } as any);
+
+  it("enrols the pubkey when the JWT is valid and the caller has push access", async () => {
+    verifyTokenMock.mockResolvedValue("github:domvinyard");
+    enrollMock({ push: true });
+    const env = enrollEnv();
+    const r = await handleExchangeEnroll(ENROLLPOST({ repo: "known-life/foo", pubkey: OWNER_OPENSSH }), env);
+    expect(r.status).toBe(200);
+    expect(await r.json()).toMatchObject({ ok: true, repo: "known-life/foo" });
+    expect((await env.KNOWN_KV.get("lifekey:pub:known-life/foo"))?.trim()).toBe(OWNER_OPENSSH);
+  });
+
+  it("401 when the JWT is invalid (no proven GitHub identity)", async () => {
+    verifyTokenMock.mockResolvedValue(null);
+    enrollMock();
+    const r = await handleExchangeEnroll(ENROLLPOST({ repo: "known-life/foo", pubkey: OWNER_OPENSSH }), enrollEnv());
+    expect(r.status).toBe(401);
+  });
+
+  it("401 when no Authorization header is present", async () => {
+    verifyTokenMock.mockResolvedValue("github:domvinyard");
+    const r = await handleExchangeEnroll(ENROLLPOST({ repo: "known-life/foo", pubkey: OWNER_OPENSSH }, null), enrollEnv());
+    expect(r.status).toBe(401);
+  });
+
+  it("400 on a pubkey that isn't an ssh-ed25519 line", async () => {
+    verifyTokenMock.mockResolvedValue("github:domvinyard");
+    const r = await handleExchangeEnroll(ENROLLPOST({ repo: "known-life/foo", pubkey: "not-a-key" }), enrollEnv());
+    expect(r.status).toBe(400);
+  });
+
+  it("400 on a malformed repo", async () => {
+    verifyTokenMock.mockResolvedValue("github:domvinyard");
+    const r = await handleExchangeEnroll(ENROLLPOST({ repo: "../etc", pubkey: OWNER_OPENSSH }), enrollEnv());
+    expect(r.status).toBe(400);
+  });
+
+  it("410 when the enroller's GitHub token has expired (restart device flow)", async () => {
+    verifyTokenMock.mockResolvedValue("github:domvinyard");
+    const r = await handleExchangeEnroll(ENROLLPOST({ repo: "known-life/foo", pubkey: OWNER_OPENSSH }), enrollEnv({}));
+    expect(r.status).toBe(410);
+  });
+
+  it("403 when the caller lacks push access to the repo (can't speak for the .life)", async () => {
+    verifyTokenMock.mockResolvedValue("github:domvinyard");
+    enrollMock({ push: false });
+    const env = enrollEnv();
+    const r = await handleExchangeEnroll(ENROLLPOST({ repo: "known-life/foo", pubkey: OWNER_OPENSSH }), env);
+    expect(r.status).toBe(403);
+    expect(await env.KNOWN_KV.get("lifekey:pub:known-life/foo")).toBeNull(); // nothing stored
+  });
+
+  it("403 when the repo is inaccessible with the caller's token", async () => {
+    verifyTokenMock.mockResolvedValue("github:domvinyard");
+    enrollMock({ repoOk: false });
+    const r = await handleExchangeEnroll(ENROLLPOST({ repo: "known-life/foo", pubkey: OWNER_OPENSSH }), enrollEnv());
+    expect(r.status).toBe(403);
+  });
+
+  it("end-to-end: an enrolled org repo then passes /exchange/verify with empty .keys", async () => {
+    // 1. enrol
+    verifyTokenMock.mockResolvedValue("github:known-life-admin");
+    enrollMock({ push: true });
+    const kv = makeKV({ ...APP_SEED, "gh:tok:known-life-admin": JSON.stringify({ token: "ght" }) });
+    const env = { KNOWN_KV: kv, PUBLIC_URL: "https://known.life" } as any;
+    expect((await handleExchangeEnroll(ENROLLPOST({ repo: "known-life/foo", pubkey: OWNER_OPENSSH }), env)).status).toBe(200);
+    // 2. verify (org: empty .keys) — succeeds purely on the enrolled key
+    const NONCE = "0011223344556677";
+    ghMock({ nonceContent: NONCE, ownerKeys: "" });
+    const r = await handleExchangeVerify(
+      POST({ repo: "known-life/foo", ref: `life-bootstrap/${NONCE}`, path: `.life-exchange/${NONCE}`, nonce: NONCE, ...sign("verify", "known-life/foo", NONCE) }),
+      env);
+    expect(await r.json()).toMatchObject({ ok: true });
   });
 });

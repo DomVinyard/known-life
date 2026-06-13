@@ -50,6 +50,7 @@ import {
   handleExchangeDeleteBranch,
   handleExchangeMergePR,
   handleAppInstalled,
+  handleExchangeEnroll,
 } from "./routes/github-app";
 import { handleSkill } from "./routes/skill";
 import { isValidName } from "./lib/id";
@@ -104,6 +105,7 @@ export async function registryFetch(
   if (path === "/exchange/delete-branch" && method === "POST") return handleExchangeDeleteBranch(req, env);
   if (path === "/exchange/merge-pr" && method === "POST") return handleExchangeMergePR(req, env);
   if (path === "/exchange/installed" && method === "GET") return handleAppInstalled(req, env);
+  if (path === "/exchange/enroll" && method === "POST") return handleExchangeEnroll(req, env);
 
   // --- Cloudflare OAuth: paste-free infra onboarding (replaced cf-drop) ---
   if (path === "/api/setup/cf-oauth/start" && method === "POST") return handleCfOAuthStart(req, env);

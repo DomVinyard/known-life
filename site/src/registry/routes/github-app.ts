@@ -1,6 +1,7 @@
 import type { Env } from "../lib/types";
 import { checkRate } from "../lib/ratelimit";
-import { verifyGithubIdentity } from "../lib/lifekey-verify.mjs";
+import { verifyGithubIdentity, rawFromOpenSsh, verifyRaw } from "../lib/lifekey-verify.mjs";
+import { verifyToken } from "../lib/jwt";
 
 /**
  * /setup/github-app + /exchange/verify — the durable verifier, central half.
@@ -42,6 +43,13 @@ const K_APP_ID = "ghapp:id";
 const K_APP_PEM = "ghapp:pem";
 const K_APP_SLUG = "ghapp:slug";
 const K_STATE = (s: string) => `ghapp:state:${s}`;
+// The .life's enrolled lifekey PUBLIC key (an `ssh-ed25519 …` line), keyed by
+// repo. Written by /exchange/enroll (and opportunistically by verifyCaller on a
+// github.com/<owner>.keys match); read by verifyCaller as the FIRST caller-auth
+// path. This is what lets an ORG-owned .life verify at all — orgs expose no
+// github.com/<owner>.keys — and lets a user-owned .life survive the owner
+// rotating/removing their GitHub keys.
+const K_LIFEKEY = (repo: string) => `lifekey:pub:${repo}`;
 
 // ── credential-free crypto: an App JWT (RS256), ported from the vault worker ──
 // (validated there against a real RS256 verify). GitHub issues App keys as
@@ -203,30 +211,57 @@ const repoOk = (repo: unknown): repo is string =>
   typeof repo === "string" && /^[\w.-]+\/[\w.-]+$/.test(repo) && !repo.split("/").some((p) => p === "." || p === "..");
 
 // ── caller-auth: the vault proves it acts FOR the repo owner ──────────────────
-// /exchange/{verify,delete-branch} are open to the internet; their primitives
-// are neutered but a caller could still spend the central App's GitHub quota (or
-// DoS a public repo's branch reap). We authenticate the caller without a shared
-// secret: the vault signs its request with the OWNER's lifekey
-// (LIFEKEY_PRIVATE_KEY, held in the vault's KV; the public half is on
-// github.com/<owner>.keys), and we verify that signature here against those
-// public keys. No shared secret to leak; works from a fresh .life (the vault
-// holds the owner's key before its first /exchange). The signed message is
-// domain-separated and bound to (repo, subject, ts) so a signature can't be
-// replayed across actions, repos, or — beyond the skew window — time. MUST
-// byte-match the vault signer (secrets gene src/worker.js `callerAuthMessage`).
+// /exchange/{verify,delete-branch,merge-pr} are open to the internet; their
+// primitives are neutered but a caller could still spend the central App's GitHub
+// quota (or DoS a public repo's branch reap). We authenticate the caller without a
+// shared secret: the vault signs its request with the .life's lifekey
+// (LIFEKEY_PRIVATE_KEY, held in the vault's KV), and we verify that signature here.
+// No shared secret to leak; works from a fresh .life (the vault holds the key
+// before its first /exchange). The signed message is domain-separated and bound to
+// (repo, subject, ts) so a signature can't be replayed across actions, repos, or —
+// beyond the skew window — time. MUST byte-match the vault signer (secrets gene
+// src/worker.js `callerAuthMessage`).
+//
+// Two key sources, in order:
+//   1. The ENROLLED pubkey at central, keyed by repo (K_LIFEKEY) — written by
+//      /exchange/enroll at onboarding. The ONLY source that works for an org-owned
+//      repo (orgs expose no github.com/<owner>.keys), and it survives the owner
+//      rotating/removing their GitHub keys.
+//   2. Fallback: github.com/<owner>.keys (user repos). On a match we opportunistically
+//      enrol the matched key for the repo, so subsequent boots take path 1 — fewer
+//      github.com fetches, robust to later key removal, and self-healing across a
+//      lifekey rotation (a new key fails path 1, matches path 2, re-enrols).
 const CALLER_AUTH_SKEW_S = 300;
 export function callerAuthMessage(action: string, repo: string, subject: string, ts: number): string {
   return `known.life/exchange/${action}\n${repo}\n${subject}\n${ts}`;
 }
-async function verifyCaller(action: string, repo: string, subject: string, sig: unknown, ts: unknown): Promise<boolean> {
+async function verifyCaller(env: Env, action: string, repo: string, subject: string, sig: unknown, ts: unknown): Promise<boolean> {
   if (typeof sig !== "string" || !sig) return false;
   if (typeof ts !== "number" || !Number.isFinite(ts)) return false;
   const now = Math.floor(Date.now() / 1000);
   if (Math.abs(now - ts) > CALLER_AUTH_SKEW_S) return false;
-  const owner = repo.split("/")[0];
   const msg = callerAuthMessage(action, repo, subject, ts);
+
+  // 1. Enrolled-key path (the only one that works for org-owned repos).
+  const stored = await env.KNOWN_KV.get(K_LIFEKEY(repo));
+  if (stored) {
+    const raw = rawFromOpenSsh(stored);
+    if (raw) {
+      try { if (await verifyRaw(raw, msg, sig)) return true; } catch { /* fall through to .keys */ }
+    }
+    // The stored key didn't verify — fall through so a rotated lifekey can re-enrol.
+  }
+
+  // 2. github.com/<owner>.keys fallback (user repos). matchedKey is necessarily a
+  // key the signer controls (it just verified a fresh domain-separated signature),
+  // so pinning it is safe.
+  const owner = repo.split("/")[0];
   const res = await verifyGithubIdentity(owner, msg, sig);
-  return !!res.ok;
+  if (res.ok) {
+    if (res.matchedKey) await env.KNOWN_KV.put(K_LIFEKEY(repo), res.matchedKey);
+    return true;
+  }
+  return false;
 }
 
 // POST /exchange/verify { repo, ref, path, nonce } — the delegated nonce read.
@@ -256,7 +291,7 @@ export async function handleExchangeVerify(req: Request, env: Env): Promise<Resp
   // Caller-auth BEFORE any GitHub call: an unauthenticated request never spends
   // the central App's quota. The vault signs (repo, nonce, ts) with the owner's
   // lifekey; we verify against github.com/<owner>.keys.
-  if (!(await verifyCaller("verify", repo, nonce, body?.sig, body?.ts))) {
+  if (!(await verifyCaller(env, "verify", repo, nonce, body?.sig, body?.ts))) {
     return json(401, { ok: false, error: "caller auth failed" });
   }
 
@@ -301,6 +336,59 @@ export async function handleAppInstalled(req: Request, env: Env): Promise<Respon
   return json(200, { installed, install_url });
 }
 
+// POST /exchange/enroll { repo, pubkey }  (Authorization: Bearer <known.life JWT>)
+//
+// Enrol the .life's lifekey PUBLIC key at central, keyed by repo, so caller-auth
+// (verifyCaller) can verify the lifekey signature without github.com/<owner>.keys.
+// This is what makes an ORG-owned .life work: orgs expose no `.keys`, so the
+// fallback path can never authenticate them — the enrolled key is their only path.
+// (User repos get it for free via verifyCaller's opportunistic enrol; this endpoint
+// is the explicit enrolment onboarding calls, and the only enrolment available to an
+// org repo.)
+//
+// Trust at enrolment = proven GitHub identity (the known.life JWT, sub github:<login>)
+// AND push access to the repo, checked with the enroller's OWN cached GitHub token
+// (gh:tok:<login> — the same device-flow token setup already holds to create the repo
+// and register the lifekey, so it's fresh at enrolment). Two deliberate choices:
+//   - We check push access with the USER's token, never the App's: "who may speak for
+//     this .life" is push-access (the repo-control trust model — see secret-tiers), and
+//     reading collaborator permission via the App would need an Administration grant the
+//     App deliberately does not hold (the within-grant rule — durable-github-verifier).
+//   - Re-enrolment by any push-holder is allowed (legitimate lifekey rotation); the
+//     repo's contributors own this key, unlike the global central App credential.
+export async function handleExchangeEnroll(req: Request, env: Env): Promise<Response> {
+  const ip = req.headers.get("CF-Connecting-IP") ?? "unknown";
+  const rl = await checkRate(env, `ghenroll:${ip}`, 30, 60 * 60);
+  if (!rl.ok) return json(429, { ok: false, error: "rate_limited" });
+
+  const authHeader = req.headers.get("Authorization") ?? "";
+  const jwt = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  const subject = jwt ? await verifyToken(jwt, env) : null;
+  if (!subject || !subject.startsWith("github:")) return json(401, { ok: false, error: "unauthorized" });
+  const login = subject.slice("github:".length);
+
+  const body = await req.json().catch(() => null) as { repo?: string; pubkey?: string } | null;
+  const repo = body?.repo, pubkey = body?.pubkey;
+  if (!repoOk(repo)) return json(400, { ok: false, error: "repo required (owner/repo)" });
+  if (typeof pubkey !== "string" || !rawFromOpenSsh(pubkey)) {
+    return json(400, { ok: false, error: "pubkey required (an ssh-ed25519 line)" });
+  }
+
+  // Prove push access with the enroller's cached GitHub token (set by the device-flow
+  // OAuth bridge). 410 (not 401) when it's gone: the JWT is fine, the upstream GitHub
+  // grant it represents expired — setup restarts the device flow on 410.
+  const ghRaw = await env.KNOWN_KV.get(`gh:tok:${login.toLowerCase()}`);
+  if (!ghRaw) return json(410, { ok: false, error: "github auth expired; restart device flow" });
+  const ghTok = (JSON.parse(ghRaw) as { token: string }).token;
+  const rr = await fetch(`${GH}/repos/${repo}`, { headers: ghHeaders(ghTok) });
+  if (!rr.ok) return json(403, { ok: false, error: "cannot access repo with your GitHub token" });
+  const perms = ((await rr.json()) as { permissions?: { push?: boolean } }).permissions;
+  if (!perms?.push) return json(403, { ok: false, error: "you lack push access to this repo" });
+
+  await env.KNOWN_KV.put(K_LIFEKEY(repo!), pubkey.trim());
+  return json(200, { ok: true, repo, login });
+}
+
 // POST /exchange/delete-branch { repo, branch } — delete a spent branch a
 // session can't (the harness git proxy 403s ref deletion). The brokered-ops
 // pattern the vault used, with its GitHub credential swapped to the App. Guarded
@@ -321,7 +409,7 @@ export async function handleExchangeDeleteBranch(req: Request, env: Env): Promis
   }
   // Caller-auth BEFORE any GitHub call (same scheme as /exchange/verify): the
   // vault signs (repo, branch, ts) with the owner's lifekey.
-  if (!(await verifyCaller("delete-branch", repo, branch, body?.sig, body?.ts))) {
+  if (!(await verifyCaller(env, "delete-branch", repo, branch, body?.sig, body?.ts))) {
     return json(401, { ok: false, error: "caller auth failed" });
   }
 
@@ -406,7 +494,7 @@ export async function handleExchangeMergePR(req: Request, env: Env): Promise<Res
   // the vault signs (repo, sha, ts) with the owner's lifekey. Binding the subject
   // to the SHA pins the signature to the exact commit being merged — it can't be
   // replayed to merge a later, unverified head.
-  if (!(await verifyCaller("merge-pr", repo, sha, body?.sig, body?.ts))) {
+  if (!(await verifyCaller(env, "merge-pr", repo, sha, body?.sig, body?.ts))) {
     return json(401, { ok: false, error: "caller auth failed" });
   }
 
