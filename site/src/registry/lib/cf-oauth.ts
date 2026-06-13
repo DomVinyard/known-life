@@ -14,8 +14,20 @@ import type { Env } from "./types";
  * token https://dash.cloudflare.com/oauth2/token. Flow: auth-code + PKCE (S256).
  * The client is confidential (token_endpoint_auth_method client_secret_basic), so
  * the token leg authenticates with HTTP Basic client_id:client_secret AND the PKCE
- * verifier. Scopes are the create API's own snake_case vocabulary (NOT wrangler's
- * colon form) — the set the client was registered with is below.
+ * verifier.
+ *
+ * Scopes are Cloudflare's canonical **dot-notation scope IDs**, discovered from
+ * `GET https://api.cloudflare.com/client/v4/oauth/scopes` (the authoritative list;
+ * needs an OAuth-App-Registrations token). Hard-won 2026-06-13 across two failed
+ * consents: the create API only format-checks scopes (rejects a colon `:` with
+ * `70722`, but waves through any snake_case string), so the client was first
+ * registered with made-up `account_read`-style names — which the create API and
+ * even the authorize endpoint accepted, yet the **consent screen** rejected as
+ * `Unknown oauth scope` because they aren't real scope IDs. The dot IDs below are
+ * the real ones from `/oauth/scopes`; the client's REGISTERED scopes must match
+ * this set exactly (the authorize endpoint rejects any requested scope not
+ * registered). `offline_access` is the standard OIDC scope (not in `/oauth/scopes`
+ * but valid) that yields the refresh token.
  */
 
 const CF_AUTHORIZE = "https://dash.cloudflare.com/oauth2/auth";
@@ -23,14 +35,16 @@ const CF_TOKEN = "https://dash.cloudflare.com/oauth2/token";
 const CF_ACCOUNTS = "https://api.cloudflare.com/client/v4/accounts";
 
 // The scopes known.life's client is registered with (least-privilege deploy set).
+// Dot-notation IDs from /oauth/scopes — see the header note. Keep in sync with the
+// registered client (PATCH /accounts/{id}/oauth_clients/{id}).
 export const CF_OAUTH_SCOPES = [
-  "account_read",
-  "user_read",
-  "workers_scripts_write",
-  "workers_kv_storage_write",
-  "workers_r2_write",
-  "d1_write",
-  "workers_routes_write",
+  "memberships.read", // list the user's accounts (the callback's GET /accounts)
+  "user-details.read",
+  "workers-scripts.write",
+  "workers-kv-storage.write",
+  "workers-r2.write",
+  "d1.write",
+  "workers-routes.write",
   "offline_access", // yields the refresh token
 ];
 
