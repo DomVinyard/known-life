@@ -42,8 +42,6 @@ import {
   handleToken,
 } from "./routes/mcp-oauth";
 import {
-  handleCreateSession,
-  handleRedeemSession,
   handleCreateCfDrop,
   handleCfDropForm,
   handleCfDropSubmit,
@@ -102,11 +100,6 @@ export async function registryFetch(
   if (path === "/api/oauth/github-callback" && method === "GET") return handleGithubCallback(req, env);
   if (path === "/api/oauth/device-code" && method === "POST") return handleDeviceCode(req, env);
   if (path === "/api/oauth/token" && method === "POST") return handleToken(req, env);
-
-  // --- /setup (hosted bootstrap flow; see routes/setup.ts) ---
-  if (path === "/api/setup/session" && method === "POST") return handleCreateSession(req, env);
-  const setupMatch = path.match(/^\/setup\/([a-f0-9]+)$/);
-  if (setupMatch && method === "GET") return handleRedeemSession(req, env, setupMatch[1]);
 
   // --- durable verifier: the known.life GitHub App (central half) ---
   if (path === "/setup/github-app" && method === "GET") return handleAppManifestStart(req, env);

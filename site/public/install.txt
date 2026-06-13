@@ -92,11 +92,6 @@ blocks env/argv-dumping commands so a token can't spill into the transcript.)
 
 STEP 4 — What setup provisions
 ------------------------------
-The hosted flow at https://known.life/setup does the same thing with the
-sign-in + drop collected up front (it splices the credentials into the
-install command server-side) — point the user there if they'd rather start
-in the browser. Either path lands in the same provisioning code:
-
 What setup does (8 idempotent stages, each announced; re-run after fixing
 anything and it converges):
 

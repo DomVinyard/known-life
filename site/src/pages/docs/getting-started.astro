@@ -55,8 +55,8 @@ life deploy &lt;dir&gt;      # provision + ship a living directory</code></pre>
   <pre><code>life setup</code></pre>
   <p>Tell the agent <em>"set up known.life"</em> (or "bring this repo to life") and it follows the runbook at <a href="/install.txt">/install.txt</a>. It stops the user exactly once, for two credentials:</p>
   <ul>
-    <li><strong>A GitHub sign-in</strong> — the hosted <a href="/setup">known.life/setup</a> page uses an OAuth grant; the raw terminal path uses GitHub's device flow. No personal access token to mint. <strong>No SSH paste to do by hand either:</strong> setup generates an Ed25519 lifekey and auto-registers its public half on <code>github.com/&lt;login&gt;.keys</code>. That key then signs every genepool write you publish.</li>
-    <li><strong>A Cloudflare API token</strong> (Workers + KV + D1) — <a href="https://dash.cloudflare.com/profile/api-tokens">create token</a>, pasted once into the setup form (or the browser drop-box the terminal path mints).</li>
+    <li><strong>A GitHub sign-in</strong> — the agent runs GitHub's device flow (it shows a short code, the user approves it in the browser). No personal access token to mint. <strong>No SSH paste to do by hand either:</strong> setup generates an Ed25519 lifekey and auto-registers its public half on <code>github.com/&lt;login&gt;.keys</code>. That key then signs every genepool write you publish.</li>
+    <li><strong>A Cloudflare API token</strong> (Workers + KV + D1) — <a href="https://dash.cloudflare.com/profile/api-tokens">create token</a>, pasted once into the single-use browser drop-box setup mints.</li>
   </ul>
   <p>The flow's contract:</p>
   <ul>

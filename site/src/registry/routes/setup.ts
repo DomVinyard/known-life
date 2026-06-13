@@ -4,166 +4,29 @@ import { checkRate } from "../lib/ratelimit";
 import { seedActionsSecrets } from "../lib/gh-secrets";
 
 /**
- * /setup — the hosted bootstrap flow. The page at /setup walks a user through:
+ * /setup — the cold-start credential flow.
  *
- *   1. OAuth into github.com (via the existing mcp-oauth bridge, scope = repo +
- *      workflow + admin:public_key + read:user). The bridge caches the GitHub access token
- *      under gh:tok:<login> (see routes/mcp-oauth.ts:3a) so this route can call
- *      GitHub on behalf of the user WITHOUT ever sending the GH token to the
- *      browser.
- *   2. Browser collects Cloudflare API token, account ID, repo slug — POSTs
- *      them here with the known.life JWT as Bearer.
- *   3. We validate the CF token + the repo, store the per-user setup session
- *      in KV, return a short opaque handle.
- *   4. The page tells the user to run:
- *          curl -fsSL https://known.life/setup/<handle> | sh
- *   5. GET /setup/<handle> redeems the session ONCE, splices the credentials
- *      into the standard install.sh as env-var exports, returns the script.
+ * In Life the AGENT drives every command (the user never operates a terminal),
+ * so onboarding is agent-driven: the agent device-flows into a known.life JWT
+ * (sub: github:<login>), and the OAuth bridge caches the GitHub access token at
+ * gh:tok:<login> as a side-effect of the elevated-scope grant. The only
+ * credential it can't obtain that way — the Cloudflare token (CF has no device
+ * flow) — is collected via a single-use, JWT-bound browser drop-box. The
+ * credential bundle is delivered back to the setup process over a
+ * JWT-authenticated POST (/api/setup/redeem), bound to the originating login —
+ * never baked into a fetchable artifact. See the section below for the contract.
  *
- * The browser never holds the GitHub access token or the rendered install.sh.
- * The terminal command does NOT carry credentials in its query string — only
- * the handle, which is single-use and short-TTL.
+ * (An older browser flow — a hosted page that POSTed creds and handed back a
+ * `curl <handle> | sh` with the credentials spliced into install.sh — was
+ * removed: it delivered creds to a bare terminal that holds no known.life
+ * identity, so the handle was the only auth and it could never be
+ * identity-bound. It served the pre-Life "human runs commands on a laptop"
+ * model; the agent cf-drop flow below replaces it.)
  */
 
-const SESSION_TTL_S = 600;          // 10 min — user has to copy/paste + run within this window
-const CF_DROP_TTL_S = 600;          // 10 min — same window for the agent flow's CF drop
+const CF_DROP_TTL_S = 600;          // 10 min — the agent flow's CF drop window
 const CF_VERIFY = "https://api.cloudflare.com/client/v4/user/tokens/verify";
 const CF_ACCOUNTS = "https://api.cloudflare.com/client/v4/accounts";
-const GH_REPO = (slug: string) => `https://api.github.com/repos/${slug}`;
-
-interface SetupSession {
-  github_login: string;
-  github_access_token: string;
-  cloudflare_api_token: string;
-  cloudflare_account_id: string;
-  repo_slug: string;
-  created_at: number;
-}
-
-// POST /api/setup/session   { cloudflare_api_token, cloudflare_account_id, repo_slug }
-//   Authorization: Bearer <known.life JWT>
-export async function handleCreateSession(req: Request, env: Env): Promise<Response> {
-  const ip = req.headers.get("CF-Connecting-IP") ?? "unknown";
-  const rl = await checkRate(env, `setup:${ip}`, 20, 60 * 60);
-  if (!rl.ok) return json(429, { error: "rate_limited", retry_after_s: rl.retryAfter });
-
-  // Auth: known.life JWT (gives us the github login).
-  const authHeader = req.headers.get("Authorization") ?? "";
-  const tok = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
-  const subject = tok ? await verifyToken(tok, env) : null;
-  if (!subject || !subject.startsWith("github:")) return json(401, { error: "unauthorized" });
-  const login = subject.slice("github:".length);
-
-  // The bridge cached the GitHub access token (alongside the JWT) only if the
-  // upstream scope was beyond read:user — i.e. only if the user came in
-  // through the /setup OAuth flow, not the plain MCP flow.
-  const ghTokRaw = await env.KNOWN_KV.get(`gh:tok:${login}`);
-  if (!ghTokRaw) return json(401, { error: "github_token_unavailable", hint: "OAuth flow must request scope=repo,workflow,admin:public_key,read:user — sign in via /setup, not /mcp" });
-  const ghTok = JSON.parse(ghTokRaw) as { token: string; scope: string };
-
-  // Body.
-  const body = await req.json().catch(() => null) as
-    | { cloudflare_api_token?: string; cloudflare_account_id?: string; repo_slug?: string }
-    | null;
-  if (!body) return json(400, { error: "bad_json" });
-  const cf_tok = (body.cloudflare_api_token || "").trim();
-  const cf_acc = (body.cloudflare_account_id || "").trim();
-  const slug = (body.repo_slug || "").trim();
-  if (!cf_tok) return json(400, { error: "missing_field", field: "cloudflare_api_token" });
-  if (!cf_acc || !/^[a-f0-9]{32}$/.test(cf_acc)) return json(400, { error: "invalid_field", field: "cloudflare_account_id", hint: "32-char hex" });
-  if (!slug || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(slug)) return json(400, { error: "invalid_field", field: "repo_slug", hint: "owner/repo" });
-
-  // Validate the CF token via the standard verify endpoint.
-  const cfRes = await fetch(CF_VERIFY, {
-    headers: { Authorization: `Bearer ${cf_tok}` },
-  });
-  const cfBody = await cfRes.json().catch(() => ({})) as { success?: boolean; result?: { status?: string }; errors?: unknown };
-  if (!cfRes.ok || !cfBody.success || cfBody.result?.status !== "active") {
-    return json(400, { error: "invalid_cloudflare_token", hint: "create a token with Account:Workers + D1 + KV + R2 perms" });
-  }
-
-  // Validate the repo exists + the user can push.
-  const repoRes = await fetch(GH_REPO(slug), {
-    headers: { Authorization: `Bearer ${ghTok.token}`, Accept: "application/vnd.github+json", "User-Agent": "known.life-setup" },
-  });
-  if (repoRes.status === 404) return json(400, { error: "repo_not_found", hint: `${slug} doesn't exist or this OAuth grant can't see it` });
-  if (!repoRes.ok) return json(502, { error: "github_unreachable", status: repoRes.status });
-  const repoBody = await repoRes.json().catch(() => ({})) as { permissions?: { push?: boolean; admin?: boolean }; login?: string };
-  if (!repoBody.permissions?.push) return json(403, { error: "no_push_permission", hint: `${login} can't push to ${slug}` });
-
-  // Seed the repo's Actions secrets so the generated deploy.yml (the
-  // ci-deploy convention) can deploy from the first push — one pasted token,
-  // two destinations: vault for sessions, Actions secrets for CI. Non-fatal:
-  // the vault path is unaffected, but the failure is surfaced in the response.
-  const ci = await seedActionsSecrets(ghTok.token, slug, {
-    CLOUDFLARE_API_TOKEN: cf_tok,
-    CLOUDFLARE_ACCOUNT_ID: cf_acc,
-  });
-
-  // All good — store the session.
-  const handle = randomHandle(24);
-  const session: SetupSession = {
-    github_login: login,
-    github_access_token: ghTok.token,
-    cloudflare_api_token: cf_tok,
-    cloudflare_account_id: cf_acc,
-    repo_slug: slug,
-    created_at: Date.now(),
-  };
-  await env.KNOWN_KV.put(`setup:session:${handle}`, JSON.stringify(session), {
-    expirationTtl: SESSION_TTL_S,
-  });
-
-  const origin = env.PUBLIC_URL ?? new URL(req.url).origin;
-  return json(200, {
-    ok: true,
-    handle,
-    expires_in: SESSION_TTL_S,
-    install_cmd: `curl -fsSL ${origin}/setup/${handle} | sh`,
-    install_url: `${origin}/setup/${handle}`,
-    ci_secrets_seeded: ci.ok,
-    ...(ci.ok ? {} : { ci_secrets_error: ci.error }),
-  });
-}
-
-// GET /setup/<handle>
-//   Redeems the session ONCE and returns the standard install.sh with the
-//   credentials inlined as env exports at the top, so the script's tail (which
-//   already detects $CLOUDFLARE_API_TOKEN + $GITHUB_TOKEN) chains into bootstrap.
-//
-// Returns text/x-shellscript. Single-use: the KV entry is deleted before the
-// response is built.
-export async function handleRedeemSession(req: Request, env: Env, handle: string): Promise<Response> {
-  if (!/^[a-f0-9]{48}$/.test(handle)) return shell(404, "echo 'invalid setup handle' >&2; exit 1\n");
-  const raw = await env.KNOWN_KV.get(`setup:session:${handle}`);
-  if (!raw) {
-    return shell(410, "echo 'setup session expired or already redeemed' >&2; exit 1\n");
-  }
-  await env.KNOWN_KV.delete(`setup:session:${handle}`);
-  const s: SetupSession = JSON.parse(raw);
-
-  // Fetch the bare install.sh from our own static assets so we don't drift.
-  const baseUrl = env.PUBLIC_URL ?? new URL(req.url).origin;
-  const baseRes = await fetch(`${baseUrl}/install.sh`);
-  if (!baseRes.ok) return shell(502, "echo 'could not fetch base install.sh' >&2; exit 1\n");
-  const base = await baseRes.text();
-
-  // Prepend the env exports + a clear sigil so debugging is easy.
-  const stamp = new Date().toISOString();
-  const personalized =
-    `#!/bin/sh\n` +
-    `# Generated by known.life/setup at ${stamp} for @${s.github_login} → ${s.repo_slug}\n` +
-    `# This file is single-use; the handle has been redeemed.\n` +
-    `export CLOUDFLARE_API_TOKEN=${shQuote(s.cloudflare_api_token)}\n` +
-    `export CLOUDFLARE_ACCOUNT_ID=${shQuote(s.cloudflare_account_id)}\n` +
-    `export GITHUB_TOKEN=${shQuote(s.github_access_token)}\n` +
-    `export GITHUB_LOGIN=${shQuote(s.github_login)}\n` +
-    `export LIFE_REPO_SLUG=${shQuote(s.repo_slug)}\n` +
-    `export LIFE_SETUP_AUTORUN=1\n` +
-    base.replace(/^#!\/bin\/sh\s*\n?/, "");
-
-  return shell(200, personalized);
-}
 
 function randomHandle(bytes: number): string {
   const b = new Uint8Array(bytes);
@@ -171,19 +34,9 @@ function randomHandle(bytes: number): string {
   return Array.from(b, (n) => n.toString(16).padStart(2, "0")).join("");
 }
 
-function shQuote(s: string): string {
-  // Single-quote with embedded apostrophe escape.
-  return "'" + s.replace(/'/g, `'\\''`) + "'";
-}
-
 function json(status: number, data: unknown): Response {
   return new Response(JSON.stringify(data), {
     status, headers: { "Content-Type": "application/json; charset=utf-8" },
-  });
-}
-function shell(status: number, body: string): Response {
-  return new Response(body, {
-    status, headers: { "Content-Type": "text/x-shellscript; charset=utf-8" },
   });
 }
 function htmlResp(status: number, body: string): Response {
@@ -196,13 +49,13 @@ function htmlResp(status: number, body: string): Response {
 // Agent-driven setup: device-flow JWT + browser drop-box for the CF token
 // ============================================================================
 //
-// Pair to the browser /setup flow above. Here the AGENT is the originator:
-// it has already device-flowed into a known.life JWT (sub: github:<login>) —
-// see routes/mcp-oauth.ts handleDeviceCode/tokenDeviceCode. The OAuth bridge
-// cached the GitHub access token at gh:tok:<login> as a side-effect of the
-// elevated-scope grant. The only credential still missing is the Cloudflare
-// token, and Cloudflare has no device flow. Solution: a single-use browser
-// drop-box on this origin, JWT-bound at creation.
+// The AGENT is the originator: it has already device-flowed into a known.life
+// JWT (sub: github:<login>) — see routes/mcp-oauth.ts handleDeviceCode/
+// tokenDeviceCode. The OAuth bridge cached the GitHub access token at
+// gh:tok:<login> as a side-effect of the elevated-scope grant. The only
+// credential still missing is the Cloudflare token, and Cloudflare has no device
+// flow. Solution: a single-use browser drop-box on this origin, JWT-bound at
+// creation.
 //
 //   POST /api/setup/cf-drop          (Bearer <known.life JWT>)
 //     Mints an opaque handle bound to the JWT's login. Returns
@@ -398,8 +251,8 @@ export async function handleAgentRedeem(req: Request, env: Env): Promise<Respons
   const gh = JSON.parse(ghRaw) as { token: string; scope: string };
 
   // If the caller told us its repo (the setup gene derives it from the git
-  // remote), seed the Actions secrets the generated deploy.yml reads — the
-  // agent-flow twin of the browser flow's seeding. Non-fatal, surfaced.
+  // remote), seed the Actions secrets the generated deploy.yml reads so it
+  // deploys from the first push. Non-fatal, surfaced.
   let ci: { ok: boolean; error?: string } = { ok: false, error: "no_repo_slug" };
   const slug = (body?.repo_slug || "").trim();
   if (slug) {
