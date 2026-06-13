@@ -46,6 +46,7 @@ import {
   handleCfDropForm,
   handleCfDropSubmit,
   handleAgentRedeem,
+  handleSetupGithubToken,
 } from "./routes/setup";
 import { handleCfOAuthStart, handleCfOAuthCallback, handleCfOAuthStatus, handleCfOAuthToken } from "./routes/cloudflare-oauth";
 import {
@@ -122,6 +123,8 @@ export async function registryFetch(
   if (path === "/api/setup/cf-oauth/status" && method === "GET") return handleCfOAuthStatus(req, env);
   if (path === "/api/setup/cf-oauth/token" && method === "POST") return handleCfOAuthToken(req, env);
   if (path === "/oauth/cf/callback" && method === "GET") return handleCfOAuthCallback(req, env);
+  // GitHub-token delivery for the OAuth setup flow (decoupled from cf-drop/redeem).
+  if (path === "/api/setup/github-token" && method === "POST") return handleSetupGithubToken(req, env);
 
   // --- API ---
   if (path === "/api/auth/challenge" && method === "POST") return handleAuthChallenge(req, env);
