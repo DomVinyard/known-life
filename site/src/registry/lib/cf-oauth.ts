@@ -207,8 +207,14 @@ function unb64(s: string) {
 }
 
 // --- per-user grant store (KV) ---
-
-const GRANT_KEY = (login: string) => `cf:grant:${login}`;
+//
+// Keyed by the LOWERCASED login: GitHub logins are case-insensitive, and the JWT
+// subject's casing varies by auth path (lifekey /auth/prove preserves what the
+// client sent; the device-flow bridge uses GitHub's canonical casing). Without
+// normalizing, a grant stored via one path is invisible to the other — caught
+// live 2026-06-13 when a device-flow session (DomVinyard) couldn't see a grant
+// stored by a lifekey session (domvinyard). One chokepoint fixes both ends.
+const GRANT_KEY = (login: string) => `cf:grant:${login.toLowerCase()}`;
 
 export async function putGrant(env: Env, login: string, grant: CfGrant): Promise<void> {
   await env.KNOWN_KV.put(GRANT_KEY(login), JSON.stringify(grant));

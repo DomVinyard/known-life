@@ -110,6 +110,22 @@ describe("per-user grant store", () => {
     expect(await getGrant(e, "octocat")).toEqual(grant);
     expect(await getGrant(e, "nobody")).toBeNull();
   });
+
+  it("is case-insensitive in the login (GitHub logins are) — a grant stored under one casing is found under another", async () => {
+    // The bug caught live 2026-06-13: a device-flow session (GitHub-canonical
+    // "DomVinyard") couldn't see a grant a lifekey session stored as "domvinyard".
+    const e = env();
+    const grant: CfGrant = {
+      refresh_token_enc: "iv.ct",
+      account_id: "acc1",
+      account_name: "Acme",
+      accounts: [{ id: "acc1", name: "Acme" }],
+      updated_at: 1,
+    };
+    await putGrant(e, "DomVinyard", grant);
+    expect(await getGrant(e, "domvinyard")).toEqual(grant);
+    expect(await getGrant(e, "DOMVINYARD")).toEqual(grant);
+  });
 });
 
 describe("POST /api/setup/cf-oauth/start", () => {

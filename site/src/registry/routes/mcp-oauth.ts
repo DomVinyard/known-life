@@ -220,7 +220,7 @@ export async function handleGithubCallback(req: Request, env: Env): Promise<Resp
   //     the browser. Same TTL as our minted JWT (1h).
   if (pending.scope !== "read:user") {
     await env.KNOWN_KV.put(
-      `gh:tok:${user.login}`,
+      `gh:tok:${user.login.toLowerCase()}`, // case-insensitive login key (see cf-oauth GRANT_KEY)
       JSON.stringify({ token: tok.access_token, scope: pending.scope }),
       { expirationTtl: 3600 },
     );
@@ -423,7 +423,7 @@ async function tokenDeviceCode(body: URLSearchParams, env: Env): Promise<Respons
   const elevated = grantedScopes.some((s: string) => s !== "read:user");
   if (elevated && gh.access_token) {
     await env.KNOWN_KV.put(
-      `gh:tok:${user.login}`,
+      `gh:tok:${user.login.toLowerCase()}`, // case-insensitive login key (see cf-oauth GRANT_KEY)
       JSON.stringify({ token: gh.access_token, scope: gh.scope ?? "" }),
       { expirationTtl: 3600 },
     );

@@ -246,7 +246,7 @@ export async function handleAgentRedeem(req: Request, env: Env): Promise<Respons
   // gh:tok cache may have evicted (1h TTL on the OAuth bridge). If so, the
   // client needs to re-do device flow. 410 distinguishes "your JWT is fine,
   // but the upstream credential it represents is gone" from a plain 401.
-  const ghRaw = await env.KNOWN_KV.get(`gh:tok:${login}`);
+  const ghRaw = await env.KNOWN_KV.get(`gh:tok:${login.toLowerCase()}`); // case-insensitive login key
   if (!ghRaw) return json(410, { error: "gh_token_expired", hint: "OAuth cache expired; restart device flow" });
   const gh = JSON.parse(ghRaw) as { token: string; scope: string };
 
@@ -304,7 +304,7 @@ export async function handleSetupGithubToken(req: Request, env: Env): Promise<Re
   // gh:tok has a 1h TTL on the OAuth bridge. 410 distinguishes "your JWT is fine
   // but the upstream GitHub credential it represents has expired" from a 401 —
   // the setup state machine restarts the device flow on 410.
-  const ghRaw = await env.KNOWN_KV.get(`gh:tok:${login}`);
+  const ghRaw = await env.KNOWN_KV.get(`gh:tok:${login.toLowerCase()}`); // case-insensitive login key
   if (!ghRaw) return json(410, { error: "gh_token_expired", hint: "OAuth cache expired; restart device flow" });
   const gh = JSON.parse(ghRaw) as { token: string; scope: string };
 
