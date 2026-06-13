@@ -1,6 +1,7 @@
 import type { Env } from "../lib/types";
 import { getVersion, getPackage, bumpInstall, providersOf } from "../lib/db";
 import { getBlob } from "../lib/blobs";
+import { checkRate } from "../lib/ratelimit";
 
 /**
  * GET /api/provides/:cap — reverse capability lookup.
@@ -85,7 +86,17 @@ export async function handleResolve(
     files[path] = content;
   }
 
-  if (isInstall && have !== version) ctx.waitUntil(bumpInstall(env, name, version, life));
+  // Count a genuine adoption, but cap per-IP so a forged ?life=&reason=install
+  // spray can't inflate the ranking signal. The check + bump run off the
+  // response path (waitUntil) since the count is advisory, not load-bearing.
+  if (isInstall && have !== version) {
+    const ip = req.headers.get("CF-Connecting-IP") ?? "unknown";
+    ctx.waitUntil(
+      checkRate(env, `install-bump:${ip}`, 60, 3600).then((rl) => {
+        if (rl.ok) return bumpInstall(env, name, version, life);
+      }),
+    );
+  }
 
   return json(200, {
     name,

@@ -393,10 +393,14 @@ async function tokenDeviceCode(body: URLSearchParams, env: Env): Promise<Respons
   });
   const gh = await ghRes.json().catch(() => ({})) as { access_token?: string; scope?: string; error?: string; error_description?: string };
   if (gh.error) {
-    // Pass polling-state errors through with their standard codes. Unknown
-    // errors land as invalid_grant — the client should stop.
+    // Pass GitHub's own polling/terminal codes through verbatim (RFC 8628 §3.5)
+    // so the client's backoff loop reacts correctly; map any UNKNOWN error to
+    // invalid_grant so the client stops rather than spinning on a code it can't
+    // interpret.
     const passthrough = new Set(["authorization_pending", "slow_down", "access_denied", "expired_token"]);
-    return json(passthrough.has(gh.error) ? 400 : 400, { error: gh.error, error_description: gh.error_description ?? "" });
+    if (passthrough.has(gh.error))
+      return json(400, { error: gh.error, error_description: gh.error_description ?? "" });
+    return oauthError(400, "invalid_grant", gh.error_description || gh.error);
   }
   if (!ghRes.ok || !gh.access_token) return oauthError(400, "invalid_grant", "github device token exchange returned no access_token");
 
