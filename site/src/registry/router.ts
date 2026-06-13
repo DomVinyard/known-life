@@ -41,13 +41,7 @@ import {
   handleDeviceCode,
   handleToken,
 } from "./routes/mcp-oauth";
-import {
-  handleCreateCfDrop,
-  handleCfDropForm,
-  handleCfDropSubmit,
-  handleAgentRedeem,
-  handleSetupGithubToken,
-} from "./routes/setup";
+import { handleSetupGithubToken } from "./routes/setup";
 import { handleCfOAuthStart, handleCfOAuthCallback, handleCfOAuthStatus, handleCfOAuthToken } from "./routes/cloudflare-oauth";
 import {
   handleAppManifestStart,
@@ -111,14 +105,7 @@ export async function registryFetch(
   if (path === "/exchange/merge-pr" && method === "POST") return handleExchangeMergePR(req, env);
   if (path === "/exchange/installed" && method === "GET") return handleAppInstalled(req, env);
 
-  // --- agent-driven setup: CF drop-box + redeem (legacy paste; being retired) ---
-  if (path === "/api/setup/cf-drop" && method === "POST") return handleCreateCfDrop(req, env);
-  if (path === "/api/setup/redeem"  && method === "POST") return handleAgentRedeem(req, env);
-  const cfDropMatch = path.match(/^\/setup\/cf\/([a-f0-9]+)$/);
-  if (cfDropMatch && method === "GET")  return handleCfDropForm(req, env, cfDropMatch[1]);
-  if (cfDropMatch && method === "POST") return handleCfDropSubmit(req, env, cfDropMatch[1]);
-
-  // --- Cloudflare OAuth: paste-free infra onboarding (replaces cf-drop) ---
+  // --- Cloudflare OAuth: paste-free infra onboarding (replaced cf-drop) ---
   if (path === "/api/setup/cf-oauth/start" && method === "POST") return handleCfOAuthStart(req, env);
   if (path === "/api/setup/cf-oauth/status" && method === "GET") return handleCfOAuthStatus(req, env);
   if (path === "/api/setup/cf-oauth/token" && method === "POST") return handleCfOAuthToken(req, env);
