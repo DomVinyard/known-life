@@ -23,4 +23,9 @@ export interface Env {
   // GitHub forbids GITHUB_-prefixed names on Actions secrets, hence KNOWN_OAUTH_*.
   KNOWN_OAUTH_CLIENT_ID?: string;
   KNOWN_OAUTH_CLIENT_SECRET?: string;
+  // Cloudflare self-managed OAuth client (paste-free infra onboarding —
+  // routes/cloudflare-oauth.ts). Registered on known.life's CF account; the
+  // refresh token is brokered here, never on the container. See lib/cf-oauth.ts.
+  CF_OAUTH_CLIENT_ID?: string;
+  CF_OAUTH_CLIENT_SECRET?: string;
 }

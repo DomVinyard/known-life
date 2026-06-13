@@ -47,6 +47,7 @@ import {
   handleCfDropSubmit,
   handleAgentRedeem,
 } from "./routes/setup";
+import { handleCfOAuthStart, handleCfOAuthCallback } from "./routes/cloudflare-oauth";
 import {
   handleAppManifestStart,
   handleAppManifestCallback,
@@ -109,12 +110,16 @@ export async function registryFetch(
   if (path === "/exchange/merge-pr" && method === "POST") return handleExchangeMergePR(req, env);
   if (path === "/exchange/installed" && method === "GET") return handleAppInstalled(req, env);
 
-  // --- agent-driven setup: CF drop-box + redeem ---
+  // --- agent-driven setup: CF drop-box + redeem (legacy paste; being retired) ---
   if (path === "/api/setup/cf-drop" && method === "POST") return handleCreateCfDrop(req, env);
   if (path === "/api/setup/redeem"  && method === "POST") return handleAgentRedeem(req, env);
   const cfDropMatch = path.match(/^\/setup\/cf\/([a-f0-9]+)$/);
   if (cfDropMatch && method === "GET")  return handleCfDropForm(req, env, cfDropMatch[1]);
   if (cfDropMatch && method === "POST") return handleCfDropSubmit(req, env, cfDropMatch[1]);
+
+  // --- Cloudflare OAuth: paste-free infra onboarding (replaces cf-drop) ---
+  if (path === "/api/setup/cf-oauth/start" && method === "POST") return handleCfOAuthStart(req, env);
+  if (path === "/oauth/cf/callback" && method === "GET") return handleCfOAuthCallback(req, env);
 
   // --- API ---
   if (path === "/api/auth/challenge" && method === "POST") return handleAuthChallenge(req, env);

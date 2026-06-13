@@ -1,0 +1,150 @@
+import { describe, it, expect, beforeEach } from "vitest";
+import {
+  s256,
+  genVerifier,
+  buildAuthorizeUrl,
+  encryptSecret,
+  decryptSecret,
+  putGrant,
+  getGrant,
+  CF_OAUTH_SCOPES,
+  type CfGrant,
+} from "../src/registry/lib/cf-oauth";
+import { handleCfOAuthStart } from "../src/registry/routes/cloudflare-oauth";
+import { issueRegistryToken } from "../src/registry/lib/jwt";
+
+// The CF OAuth flow is the paste-free infra-onboarding credential path: a wrong
+// PKCE challenge, a leaked-in-the-clear refresh token, or a start route that
+// mints a consent URL for an unauthenticated caller would each be a security
+// hole. These tests pin the pure logic credential-free (no live Cloudflare).
+
+// Minimal in-memory KV mock — get/put/delete, TTL ignored (tests don't wait).
+class MockKV {
+  private m = new Map<string, string>();
+  async get(k: string): Promise<string | null> {
+    return this.m.has(k) ? this.m.get(k)! : null;
+  }
+  async put(k: string, v: string): Promise<void> {
+    this.m.set(k, v);
+  }
+  async delete(k: string): Promise<void> {
+    this.m.delete(k);
+  }
+}
+
+const SIGNING = "test-signing-key-deterministic-0123456789abcdef";
+const env = (over: Record<string, unknown> = {}) =>
+  ({
+    JWT_SIGNING_KEY: SIGNING,
+    PUBLIC_URL: "https://known.life",
+    CF_OAUTH_CLIENT_ID: "12eb82cbtest",
+    CF_OAUTH_CLIENT_SECRET: "shh-secret",
+    KNOWN_KV: new MockKV(),
+    ...over,
+  }) as any;
+
+describe("PKCE s256", () => {
+  it("matches the RFC 7636 reference vector", async () => {
+    // verifier → challenge from RFC 7636 Appendix B.
+    expect(await s256("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk")).toBe(
+      "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+    );
+  });
+
+  it("genVerifier produces a valid-length verifier (43–128 chars)", () => {
+    const v = genVerifier();
+    expect(v.length).toBeGreaterThanOrEqual(43);
+    expect(v.length).toBeLessThanOrEqual(128);
+  });
+});
+
+describe("authorize URL", () => {
+  it("carries the OAuth params and the registered scope set", () => {
+    const u = new URL(buildAuthorizeUrl(env(), { state: "ST", codeChallenge: "CH", redirectUri: "https://known.life/oauth/cf/callback" }));
+    expect(u.origin + u.pathname).toBe("https://dash.cloudflare.com/oauth2/auth");
+    expect(u.searchParams.get("response_type")).toBe("code");
+    expect(u.searchParams.get("client_id")).toBe("12eb82cbtest");
+    expect(u.searchParams.get("redirect_uri")).toBe("https://known.life/oauth/cf/callback");
+    expect(u.searchParams.get("state")).toBe("ST");
+    expect(u.searchParams.get("code_challenge")).toBe("CH");
+    expect(u.searchParams.get("code_challenge_method")).toBe("S256");
+    const scope = u.searchParams.get("scope") ?? "";
+    expect(scope.split(" ")).toEqual(CF_OAUTH_SCOPES);
+    expect(scope).toContain("offline_access");
+  });
+});
+
+describe("refresh-token encryption at rest", () => {
+  it("round-trips through encrypt/decrypt", async () => {
+    const e = env();
+    const blob = await encryptSecret(e, "refresh-abc-123");
+    expect(blob).not.toContain("refresh-abc-123"); // not stored in the clear
+    expect(await decryptSecret(e, blob)).toBe("refresh-abc-123");
+  });
+
+  it("fails to decrypt a tampered blob", async () => {
+    const e = env();
+    const blob = await encryptSecret(e, "refresh-abc-123");
+    const [iv, ct] = blob.split(".");
+    const tampered = `${iv}.${ct.slice(0, -2)}AA`;
+    await expect(decryptSecret(e, tampered)).rejects.toBeTruthy();
+  });
+
+  it("a different signing key cannot decrypt", async () => {
+    const blob = await encryptSecret(env(), "refresh-abc-123");
+    await expect(decryptSecret(env({ JWT_SIGNING_KEY: "another-key-padded-to-thirty-two-bytes-xxxx" }), blob)).rejects.toBeTruthy();
+  });
+});
+
+describe("per-user grant store", () => {
+  it("round-trips a grant through KV", async () => {
+    const e = env();
+    const grant: CfGrant = {
+      refresh_token_enc: "iv.ct",
+      account_id: "acc1",
+      account_name: "Acme",
+      accounts: [{ id: "acc1", name: "Acme" }],
+      updated_at: 1,
+    };
+    await putGrant(e, "octocat", grant);
+    expect(await getGrant(e, "octocat")).toEqual(grant);
+    expect(await getGrant(e, "nobody")).toBeNull();
+  });
+});
+
+describe("POST /api/setup/cf-oauth/start", () => {
+  const post = (e: any, headers: Record<string, string> = {}) =>
+    handleCfOAuthStart(new Request("https://known.life/api/setup/cf-oauth/start", { method: "POST", headers }), e);
+
+  it("503 when the CF client is not configured", async () => {
+    const res = await post(env({ CF_OAUTH_CLIENT_ID: undefined, CF_OAUTH_CLIENT_SECRET: undefined }));
+    expect(res.status).toBe(503);
+  });
+
+  it("401 without a bearer", async () => {
+    expect((await post(env())).status).toBe(401);
+  });
+
+  it("401 with a non-github subject is impossible — a valid github bearer is required", async () => {
+    const bad = await post(env(), { Authorization: "Bearer not-a-real-jwt" });
+    expect(bad.status).toBe(401);
+  });
+
+  it("200 with a valid github bearer → returns a consent URL whose challenge matches the stashed verifier", async () => {
+    const e = env();
+    const bearer = await issueRegistryToken("github:octocat", e);
+    const res = await post(e, { Authorization: `Bearer ${bearer}` });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { authorize_url: string; state: string };
+    const u = new URL(body.authorize_url);
+    expect(u.searchParams.get("state")).toBe(body.state);
+
+    // The pending entry must hold the verifier whose S256 equals the URL challenge,
+    // bound to the proven login.
+    const pendingRaw = await e.KNOWN_KV.get(`cf-oauth:pending:${body.state}`);
+    expect(pendingRaw).toBeTruthy();
+    const pending = JSON.parse(pendingRaw!) as { login: string; code_verifier: string };
+    expect(pending.login).toBe("octocat");
+    expect(await s256(pending.code_verifier)).toBe(u.searchParams.get("code_challenge"));
+  });
+});
