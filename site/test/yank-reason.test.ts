@@ -4,7 +4,7 @@ import { MockD1 } from "./d1-mock";
 
 // The yank reason is the agent-legible half of deprecation: stored with the
 // version forever, served on resolve, and carried by the MVS flip's
-// yank-on-new-selection error (knowledge/mvs-implementation.md — bzlmod's
+// yank-on-new-selection error (bzlmod's
 // error-with-reason model). These tests pin the round-trip over the REAL
 // schema.sql — including the yanked_reason migration ALTER, which the d1-mock
 // now applies with the production adapter's duplicate-skip contract.
