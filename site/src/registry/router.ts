@@ -47,7 +47,7 @@ import {
   handleCfDropSubmit,
   handleAgentRedeem,
 } from "./routes/setup";
-import { handleCfOAuthStart, handleCfOAuthCallback } from "./routes/cloudflare-oauth";
+import { handleCfOAuthStart, handleCfOAuthCallback, handleCfOAuthStatus } from "./routes/cloudflare-oauth";
 import {
   handleAppManifestStart,
   handleAppManifestCallback,
@@ -119,6 +119,7 @@ export async function registryFetch(
 
   // --- Cloudflare OAuth: paste-free infra onboarding (replaces cf-drop) ---
   if (path === "/api/setup/cf-oauth/start" && method === "POST") return handleCfOAuthStart(req, env);
+  if (path === "/api/setup/cf-oauth/status" && method === "GET") return handleCfOAuthStatus(req, env);
   if (path === "/oauth/cf/callback" && method === "GET") return handleCfOAuthCallback(req, env);
 
   // --- API ---

@@ -10,7 +10,7 @@ import {
   CF_OAUTH_SCOPES,
   type CfGrant,
 } from "../src/registry/lib/cf-oauth";
-import { handleCfOAuthStart } from "../src/registry/routes/cloudflare-oauth";
+import { handleCfOAuthStart, handleCfOAuthStatus } from "../src/registry/routes/cloudflare-oauth";
 import { issueRegistryToken } from "../src/registry/lib/jwt";
 
 // The CF OAuth flow is the paste-free infra-onboarding credential path: a wrong
@@ -146,5 +146,22 @@ describe("POST /api/setup/cf-oauth/start", () => {
     const pending = JSON.parse(pendingRaw!) as { login: string; code_verifier: string };
     expect(pending.login).toBe("octocat");
     expect(await s256(pending.code_verifier)).toBe(u.searchParams.get("code_challenge"));
+  });
+});
+
+describe("GET /api/setup/cf-oauth/status", () => {
+  const get = (e: any, headers: Record<string, string> = {}) =>
+    handleCfOAuthStatus(new Request("https://known.life/api/setup/cf-oauth/status", { headers }), e);
+
+  it("401 without a bearer", async () => {
+    expect((await get(env())).status).toBe(401);
+  });
+
+  it("connected:false for a github bearer with no stored grant (no network)", async () => {
+    const e = env();
+    const bearer = await issueRegistryToken("github:octocat", e);
+    const res = await get(e, { Authorization: `Bearer ${bearer}` });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ connected: false });
   });
 });

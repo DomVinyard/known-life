@@ -9,6 +9,8 @@ import {
   listAccounts,
   encryptSecret,
   putGrant,
+  getGrant,
+  mintAccessToken,
   genVerifier,
   s256,
   randomToken,
@@ -118,6 +120,51 @@ export async function handleCfOAuthCallback(req: Request, env: Env): Promise<Res
         : `Connected ${accounts.length} accounts; deploys will target ${escapeHtml(primary!.name)}.`;
 
   return htmlResp(200, page("Connected", `Cloudflare is connected for @${escapeHtml(pending.login)}. ${acctNote} Return to your agent — it has everything it needs. You can close this tab.`));
+}
+
+// GET /api/setup/cf-oauth/status  (Bearer known.life JWT)
+//
+// The broker's read surface: does this user have a live Cloudflare grant, and
+// does it actually work? `connected` reflects a stored grant; `ready` is proven
+// by minting a short-lived access token from the stored refresh token (the live
+// token exchange, performed server-side). The access token is NEVER returned —
+// this is status/verify only, and the idempotency check setup uses to know CF is
+// already connected (so a re-run resumes instead of re-consenting).
+export async function handleCfOAuthStatus(req: Request, env: Env): Promise<Response> {
+  const ip = req.headers.get("CF-Connecting-IP") ?? "unknown";
+  const rl = await checkRate(env, `cf-oauth-status:${ip}`, 60, 60 * 60);
+  if (!rl.ok) return json(429, { error: "rate_limited", retry_after_s: rl.retryAfter });
+
+  const authHeader = req.headers.get("Authorization") ?? "";
+  const tok = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  const subject = tok ? await verifyToken(tok, env) : null;
+  if (!subject || !subject.startsWith("github:")) return json(401, { error: "unauthorized" });
+  const login = subject.slice("github:".length);
+
+  const grant = await getGrant(env, login);
+  if (!grant) return json(200, { connected: false });
+
+  // Prove the grant works by minting from the stored refresh token. Report only
+  // status — never the token. A mint failure (revoked grant, rotated-out refresh)
+  // surfaces as ready:false so onboarding can prompt a reconnect.
+  try {
+    const minted = await mintAccessToken(env, login);
+    return json(200, {
+      connected: true,
+      ready: Boolean(minted),
+      account_id: grant.account_id,
+      account_name: grant.account_name,
+      accounts: grant.accounts.length,
+    });
+  } catch (e) {
+    return json(200, {
+      connected: true,
+      ready: false,
+      account_id: grant.account_id,
+      account_name: grant.account_name,
+      error: String((e as Error).message),
+    });
+  }
 }
 
 // --- helpers ---
