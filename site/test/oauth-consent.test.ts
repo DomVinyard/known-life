@@ -53,6 +53,12 @@ describe("OAuth silent-SSO open-redirect defense", () => {
     expect(r.status).toBe(200);
     expect(r.headers.get("Content-Type")).toContain("text/html");
     expect(r.headers.get("X-Frame-Options")).toBe("DENY"); // no clickjacking the consent
+    // The page must NOT set Referrer-Policy: no-referrer — that forces Origin:null
+    // on its own form POST, which Astro's checkOrigin rejects (the consent could
+    // then never be approved for any external origin). `same-origin` sends a real
+    // Origin to /consent while still leaking no Referer cross-origin.
+    expect(r.headers.get("Referrer-Policy")).not.toBe("no-referrer");
+    expect(r.headers.get("Referrer-Policy")).toBe("same-origin");
     const body = await r.text();
     expect(body).toContain("https://evil.example");
     expect(body).not.toMatch(/[?&]code=/); // no auth code anywhere in the page

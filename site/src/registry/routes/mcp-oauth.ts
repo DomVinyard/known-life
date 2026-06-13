@@ -522,7 +522,13 @@ function htmlPage(status: number, body: string): Response {
       // The consent click must be deliberate — never framed/clickjacked.
       "X-Frame-Options": "DENY",
       "Content-Security-Policy": "frame-ancestors 'none'",
-      "Referrer-Policy": "no-referrer",
+      // `same-origin`, NOT `no-referrer`: the Fetch spec forces `Origin: null`
+      // on a form POST from a `no-referrer` page, and Astro's checkOrigin then
+      // rejects the consent submit ("Cross-site POST form submissions are
+      // forbidden") — so no external-origin surface could ever be consented.
+      // `same-origin` keeps the privacy intent (no Referer leaks cross-origin)
+      // while sending a real Origin for the same-origin POST to /consent.
+      "Referrer-Policy": "same-origin",
     },
   });
 }
