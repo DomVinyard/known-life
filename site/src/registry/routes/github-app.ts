@@ -183,7 +183,18 @@ async function installationToken(env: Env, repo: string): Promise<{ token: strin
   if (inst.status === 404) return { notInstalled: true };
   if (!inst.ok) return null;
   const installationId = String(((await inst.json()) as { id: number }).id);
-  const tokRes = await fetch(`${GH}/app/installations/${installationId}/access_tokens`, { method: "POST", headers: ghHeaders(jwt) });
+  // Narrow the minted token to THIS repo + only the perms the App holds
+  // (site-security-audit #5): an installation-wide token could touch every repo
+  // in the installation, but every delegated op (verify/delete-branch/merge-pr)
+  // acts on exactly `repo`. `repositories` takes bare names; APP_PERMS is the
+  // App's full grant, so requesting it is always a valid subset. Behaviourally
+  // identical on a single-repo install (the dogfood) — verified via /exchange.
+  const repoName = repo.split("/")[1];
+  const tokRes = await fetch(`${GH}/app/installations/${installationId}/access_tokens`, {
+    method: "POST",
+    headers: { ...ghHeaders(jwt), "Content-Type": "application/json" },
+    body: JSON.stringify({ repositories: [repoName], permissions: APP_PERMS }),
+  });
   if (!tokRes.ok) return null;
   return { token: ((await tokRes.json()) as { token: string }).token };
 }

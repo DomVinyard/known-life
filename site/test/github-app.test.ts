@@ -92,6 +92,7 @@ function ghMock(opts: { installed?: boolean; nonceContent?: string | null } = {}
   const { installed = true, nonceContent = null } = opts;
   const deleted: string[] = [];
   let mintedJwt: string | null = null;
+  let mintBody: any = null;
   const fetchMock = vi.fn(async (url: any, init: any = {}) => {
     const u = String(url);
     if (/github\.com\/[^/]+\.keys$/.test(u)) return new Response(OWNER_OPENSSH + "\n", { status: 200 });
@@ -103,6 +104,7 @@ function ghMock(opts: { installed?: boolean; nonceContent?: string | null } = {}
         : new Response("Not Found", { status: 404 });
     }
     if (/\/app\/installations\/[^/]+\/access_tokens$/.test(u) && init.method === "POST") {
+      mintBody = init.body ? JSON.parse(init.body) : null;
       return new Response(JSON.stringify({ token: "inst-tok" }), { status: 200 });
     }
     const m = u.match(/\/repos\/(.+?)\/contents\/(.+?)\?ref=(.+)$/);
@@ -119,7 +121,7 @@ function ghMock(opts: { installed?: boolean; nonceContent?: string | null } = {}
     return new Response("unexpected", { status: 500 });
   });
   vi.stubGlobal("fetch", fetchMock);
-  return { deleted, getJwt: () => mintedJwt };
+  return { deleted, getJwt: () => mintedJwt, getMintBody: () => mintBody };
 }
 
 describe("handleExchangeVerify", () => {
@@ -141,6 +143,9 @@ describe("handleExchangeVerify", () => {
     v.update(`${h}.${pl}`);
     expect(v.verify(APP_PUB_PEM, Buffer.from(sig.replace(/-/g, "+").replace(/_/g, "/"), "base64"))).toBe(true);
     expect(m.deleted.length).toBe(1); // the throwaway life-bootstrap branch is reaped
+    // site-security-audit #5: the minted token is narrowed to THIS repo + only
+    // the App's perms — never an installation-wide token.
+    expect(m.getMintBody()).toEqual({ repositories: ["r"], permissions: { contents: "write", metadata: "read" } });
   });
 
   it("ok:false on a nonce mismatch — no false positive (auth bypass guard)", async () => {
