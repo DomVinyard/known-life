@@ -1,7 +1,6 @@
 import type { Env } from "../lib/types";
 import { checkRate } from "../lib/ratelimit";
 import { verifyGithubIdentity, rawFromOpenSsh, verifyRaw } from "../lib/lifekey-verify.mjs";
-import { verifyToken } from "../lib/jwt";
 
 /**
  * /setup/github-app + /exchange/verify — the durable verifier, central half.
@@ -336,36 +335,35 @@ export async function handleAppInstalled(req: Request, env: Env): Promise<Respon
   return json(200, { installed, install_url });
 }
 
-// POST /exchange/enroll { repo, pubkey }  (Authorization: Bearer <known.life JWT>)
+// POST /exchange/enroll { repo, pubkey }  (Authorization: Bearer <github user token>)
 //
 // Enrol the .life's lifekey PUBLIC key at central, keyed by repo, so caller-auth
 // (verifyCaller) can verify the lifekey signature without github.com/<owner>.keys.
 // This is what makes an ORG-owned .life work: orgs expose no `.keys`, so the
 // fallback path can never authenticate them — the enrolled key is their only path.
 // (User repos get it for free via verifyCaller's opportunistic enrol; this endpoint
-// is the explicit enrolment onboarding calls, and the only enrolment available to an
-// org repo.)
+// is the explicit enrolment onboarding calls, and the only enrolment for an org repo.)
 //
-// Trust at enrolment = proven GitHub identity (the known.life JWT, sub github:<login>)
-// AND push access to the repo, checked with the enroller's OWN cached GitHub token
-// (gh:tok:<login> — the same device-flow token setup already holds to create the repo
-// and register the lifekey, so it's fresh at enrolment). Two deliberate choices:
-//   - We check push access with the USER's token, never the App's: "who may speak for
-//     this .life" is push-access (the repo-control trust model — see secret-tiers), and
-//     reading collaborator permission via the App would need an Administration grant the
-//     App deliberately does not hold (the within-grant rule — durable-github-verifier).
-//   - Re-enrolment by any push-holder is allowed (legitimate lifekey rotation); the
-//     repo's contributors own this key, unlike the global central App credential.
+// Authenticated by a GITHUB USER TOKEN (the one setup already holds at the lifekey
+// stage), which proves both halves of the trust in two calls with the SAME token:
+// identity (`GET /user`) and push access to the repo (`GET /repos/<repo>` →
+// permissions.push). Deliberate choices:
+//   - Push-access — not ownership — is the authority to speak for a .life (the
+//     repo-control trust model, secret-tiers); a collaborator may (re-)enrol, which is
+//     also how a legitimate lifekey rotation lands.
+//   - We use the caller's own token, never the central App's: reading collaborator
+//     permission via the App would need an Administration grant it deliberately doesn't
+//     hold (the within-grant rule — durable-github-verifier). The token is read from the
+//     Authorization header (not the body), and central already receives this same token
+//     via the device-flow OAuth bridge — no new exposure.
 export async function handleExchangeEnroll(req: Request, env: Env): Promise<Response> {
   const ip = req.headers.get("CF-Connecting-IP") ?? "unknown";
   const rl = await checkRate(env, `ghenroll:${ip}`, 30, 60 * 60);
   if (!rl.ok) return json(429, { ok: false, error: "rate_limited" });
 
   const authHeader = req.headers.get("Authorization") ?? "";
-  const jwt = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
-  const subject = jwt ? await verifyToken(jwt, env) : null;
-  if (!subject || !subject.startsWith("github:")) return json(401, { ok: false, error: "unauthorized" });
-  const login = subject.slice("github:".length);
+  const ghTok = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  if (!ghTok) return json(401, { ok: false, error: "unauthorized (Bearer <github token> required)" });
 
   const body = await req.json().catch(() => null) as { repo?: string; pubkey?: string } | null;
   const repo = body?.repo, pubkey = body?.pubkey;
@@ -374,12 +372,12 @@ export async function handleExchangeEnroll(req: Request, env: Env): Promise<Resp
     return json(400, { ok: false, error: "pubkey required (an ssh-ed25519 line)" });
   }
 
-  // Prove push access with the enroller's cached GitHub token (set by the device-flow
-  // OAuth bridge). 410 (not 401) when it's gone: the JWT is fine, the upstream GitHub
-  // grant it represents expired — setup restarts the device flow on 410.
-  const ghRaw = await env.KNOWN_KV.get(`gh:tok:${login.toLowerCase()}`);
-  if (!ghRaw) return json(410, { ok: false, error: "github auth expired; restart device flow" });
-  const ghTok = (JSON.parse(ghRaw) as { token: string }).token;
+  // Identity: the token must authenticate as a real GitHub user.
+  const who = await fetch(`${GH}/user`, { headers: ghHeaders(ghTok) });
+  if (!who.ok) return json(401, { ok: false, error: "invalid github token" });
+  const login = ((await who.json()) as { login?: string }).login ?? null;
+
+  // Authorization: that user must have push access to the repo being enrolled.
   const rr = await fetch(`${GH}/repos/${repo}`, { headers: ghHeaders(ghTok) });
   if (!rr.ok) return json(403, { ok: false, error: "cannot access repo with your GitHub token" });
   const perms = ((await rr.json()) as { permissions?: { push?: boolean } }).permissions;
