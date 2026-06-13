@@ -34,18 +34,49 @@ const CF_AUTHORIZE = "https://dash.cloudflare.com/oauth2/auth";
 const CF_TOKEN = "https://dash.cloudflare.com/oauth2/token";
 const CF_ACCOUNTS = "https://api.cloudflare.com/client/v4/accounts";
 
-// The scopes known.life's client is registered with (least-privilege deploy set).
-// Dot-notation IDs from /oauth/scopes — see the header note. Keep in sync with the
-// registered client (PATCH /accounts/{id}/oauth_clients/{id}).
+// The scopes onboarding requests — the FULL Workers developer-platform surface a
+// `.life` could ever deploy or bind. Dot-notation IDs from /oauth/scopes (see the
+// header note); this set EXACTLY mirrors the registered client (PATCH
+// /accounts/{id}/oauth_clients/{id}), which is its ceiling — the authorize endpoint
+// rejects any requested scope not registered.
+//
+// Deliberately BROAD, requested once. Rationale (decided 2026-06-13, see
+// knowledge/cloudflare-oauth.md): the onboarding thesis is "two taps and never
+// another credential action", so a single broad consent beats deriving a minimal
+// set per-repo and re-prompting whenever a `.life` grows a capability — that
+// re-consent flow is exactly the recurring-new-grant shape the durable-github-
+// verifier "within-grant rule" scar warns against, and it's edge-case-rich. These
+// are all developer-platform scopes (not personal data), per-user-consented, and
+// the refresh token only ever mints during that user's own deploys. Least-privilege
+// is recovered at MINT time instead (downscope the per-deploy token to a subset of
+// the granted set — standard OAuth2 refresh-grant narrowing), with zero UX cost.
+// Security/zone-admin scopes (WAF, firewall, load-balancers, access-management,
+// DNS-security, billing) are intentionally excluded.
 export const CF_OAUTH_SCOPES = [
+  // identity + refresh
   "memberships.read", // list the user's accounts (the callback's GET /accounts)
   "user-details.read",
-  "workers-scripts.write",
-  "workers-kv-storage.write",
-  "workers-r2.write",
-  "d1.write",
-  "workers-routes.write",
   "offline_access", // yields the refresh token
+  // core compute + data bindings (write + read for idempotent, preserve-on-redeploy)
+  "workers-scripts.write", "workers-scripts.read",
+  "workers-kv-storage.write", "workers-kv-storage.read",
+  "workers-r2.write", "workers-r2.read",
+  "d1.write", "d1.read",
+  "workers-routes.write", "workers-routes.read",
+  // async + vector + AI
+  "queues.write", "queues.read",
+  "vectorize.write", "vectorize.read",
+  "ai.write", "ai.read",
+  // secrets, observability
+  "secrets-store.write", "secrets-store.read",
+  "workers-observability.write", "workers-observability.read", "workers-tail.read", "logs.read",
+  // compute extras + media
+  "browser-rendering.write", "browser-rendering.read",
+  "containers.write", "containers.read",
+  "images.write", "images.read",
+  // custom domains (route:secure) + email
+  "dns.write", "dns.read", "zone.read",
+  "email-routing-rule.write", "email-routing-rule.read", "email-sending.write",
 ];
 
 export interface CfTokenResponse {
