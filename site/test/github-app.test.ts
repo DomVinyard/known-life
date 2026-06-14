@@ -230,9 +230,14 @@ describe("handleExchangeVerify", () => {
 });
 
 // A GitHub mock for delete-branch: pulls (merge check), repo (default_branch),
-// compare, and the ref DELETE.
-function delMock(opts: { installed?: boolean; mergedPr?: boolean; aheadBy?: number } = {}) {
-  const { installed = true, mergedPr = false, aheadBy = 5 } = opts;
+// compare, and the ref DELETE. `reaccepted` models whether the installation has
+// accepted the App's widened pull_requests:read grant — when false, a token mint
+// that REQUESTS pull_requests 422s (as real GitHub does), so the squash-merge PR
+// check can't run and the guard falls back to the compare/ancestry path. The old
+// mock granted any token unconditionally, which is why the dead merged_at check
+// (the operational token never carried pull_requests) looked alive in tests.
+function delMock(opts: { installed?: boolean; mergedPr?: boolean; aheadBy?: number; reaccepted?: boolean } = {}) {
+  const { installed = true, mergedPr = false, aheadBy = 5, reaccepted = true } = opts;
   const deleted: string[] = [];
   const fetchMock = vi.fn(async (url: any, init: any = {}) => {
     const u = String(url);
@@ -241,6 +246,8 @@ function delMock(opts: { installed?: boolean; mergedPr?: boolean; aheadBy?: numb
       return installed ? new Response(JSON.stringify({ id: 7 }), { status: 200 }) : new Response("", { status: 404 });
     }
     if (/\/app\/installations\/[^/]+\/access_tokens$/.test(u) && init.method === "POST") {
+      const wantsPr = !!JSON.parse(String(init.body ?? "{}"))?.permissions?.pull_requests;
+      if (wantsPr && !reaccepted) return new Response(JSON.stringify({ message: "permissions not granted" }), { status: 422 });
       return new Response(JSON.stringify({ token: "del-tok" }), { status: 200 });
     }
     if (/\/repos\/[^/]+\/[^/]+\/pulls\?/.test(u)) {
@@ -268,11 +275,22 @@ describe("handleExchangeDeleteBranch", () => {
     expect(await r.json()).toMatchObject({ ok: true });
     expect(m.deleted.length).toBe(1);
   });
-  it("deletes a MERGED claude/* branch (PR merged)", async () => {
-    const m = delMock({ mergedPr: true });
+  it("deletes a SQUASH-merged claude/* branch (PR merged, behind+ahead of main)", async () => {
+    // The real-world case: PR squash-merged, so the head is NOT an ancestor of main
+    // and the compare still shows divergence (aheadBy>0, files non-empty). Only the
+    // merged_at PR check can see the merge — and it runs once the App has pull_requests:read.
+    const m = delMock({ mergedPr: true, aheadBy: 2 });
     const r = await handleExchangeDeleteBranch(DELPOST({ repo: "o/r", branch: "claude/done", ...sign("delete-branch", "o/r", "claude/done") }), baseEnv());
     expect(await r.json()).toMatchObject({ ok: true });
     expect(m.deleted.length).toBe(1);
+  });
+  it("refuses a squash-merged branch until the App's pull_requests:read is re-accepted (degrades safe)", async () => {
+    // Before re-accept, the PR-read token mint 422s, the merged_at check can't run,
+    // and the guard falls back to compare — conservatively refusing (never lose work).
+    const m = delMock({ mergedPr: true, aheadBy: 2, reaccepted: false });
+    const r = await handleExchangeDeleteBranch(DELPOST({ repo: "o/r", branch: "claude/done", ...sign("delete-branch", "o/r", "claude/done") }), baseEnv());
+    expect(r.status).toBe(409);
+    expect(m.deleted.length).toBe(0);
   });
   it("refuses an UNMERGED claude/* branch (409, no delete) — never lose work", async () => {
     const m = delMock({ mergedPr: false, aheadBy: 5 });

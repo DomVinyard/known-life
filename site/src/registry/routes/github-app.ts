@@ -33,7 +33,23 @@ const GH = "https://api.github.com";
 // gating merge-pr is the agent's job (it reads check-runs via the github MCP),
 // because adding an App permission needs a manual owner re-accept with no API to
 // automate it — so the merge spine stays inside the permissions already granted.
+// Every operational token (verify/merge-pr/delete-branch ref write) requests only
+// these — guaranteed granted, so the spine never 422s on token mint.
 const APP_PERMS = { contents: "write", metadata: "read" } as const;
+// The App's full DECLARED grant, used only in the registration manifest. The extra
+// pull_requests:read lets delete-branch recognize a SQUASH-merged PR: a squash
+// leaves the branch head un-reachable from the default branch, so the ancestry/
+// compare fallback structurally can't see the merge — the authoritative signal is
+// a merged PR for that head, and listing PRs needs pull_requests:read. Operational
+// tokens still stay narrow (APP_PERMS); only the delete-branch PR-list check mints
+// a separate, 422-tolerant read token, so an installation that hasn't re-accepted
+// this widened grant degrades to the conservative ancestry check instead of
+// breaking. Changing this affects only a FRESH App registration; an existing App
+// gains the permission when its owner edits it in GitHub settings + re-accepts.
+const MANIFEST_PERMS = { ...APP_PERMS, pull_requests: "read" } as const;
+// Token perms for the squash-merge PR-list check — metadata to reach the repo,
+// pull_requests to list its PRs. 422s (→ installationToken null) until re-accepted.
+const PR_READ_PERMS = { metadata: "read", pull_requests: "read" } as const;
 const STATE_TTL_S = 600;
 const DELETABLE_REF = /^life-bootstrap\/[a-f0-9]{8,}$/;
 
@@ -104,7 +120,7 @@ function manifest(env: Env) {
     hook_attributes: { url: `${env.PUBLIC_URL}/setup/github-app/webhook`, active: false },
     redirect_url: `${env.PUBLIC_URL}/setup/github-app/callback`,
     public: false, // owner-only to start; flip to true (+ domain verification) to serve every .life
-    default_permissions: APP_PERMS,
+    default_permissions: MANIFEST_PERMS,
     default_events: [] as string[],
   };
 }
@@ -180,7 +196,7 @@ export async function handleAppManifestCallback(req: Request, env: Env): Promise
 // Mint an installation token for a repo from the known.life App. Returns the
 // token, or { notInstalled } when the App isn't on the repo, or null on error/
 // not-registered. Shared by /exchange/verify and /exchange/delete-branch.
-async function installationToken(env: Env, repo: string): Promise<{ token: string } | { notInstalled: true } | null> {
+async function installationToken(env: Env, repo: string, perms: Record<string, string> = APP_PERMS): Promise<{ token: string } | { notInstalled: true } | null> {
   const appId = await env.KNOWN_KV.get(K_APP_ID);
   const pem = await env.KNOWN_KV.get(K_APP_PEM);
   if (!appId || !pem) return null;
@@ -193,14 +209,15 @@ async function installationToken(env: Env, repo: string): Promise<{ token: strin
   // Narrow the minted token to THIS repo + only the perms the App holds
   // (site-security-audit #5): an installation-wide token could touch every repo
   // in the installation, but every delegated op (verify/delete-branch/merge-pr)
-  // acts on exactly `repo`. `repositories` takes bare names; APP_PERMS is the
-  // App's full grant, so requesting it is always a valid subset. Behaviourally
-  // identical on a single-repo install (the dogfood) — verified via /exchange.
+  // acts on exactly `repo`. `repositories` takes bare names; `perms` defaults to
+  // APP_PERMS (the App's guaranteed grant, always a valid subset). A caller may
+  // request a narrower/other set (e.g. PR_READ_PERMS for the squash-merge check);
+  // GitHub 422s if it exceeds what the installation granted, surfaced here as null.
   const repoName = repo.split("/")[1];
   const tokRes = await fetch(`${GH}/app/installations/${installationId}/access_tokens`, {
     method: "POST",
     headers: { ...ghHeaders(jwt), "Content-Type": "application/json" },
-    body: JSON.stringify({ repositories: [repoName], permissions: APP_PERMS }),
+    body: JSON.stringify({ repositories: [repoName], permissions: perms }),
   });
   if (!tokRes.ok) return null;
   return { token: ((await tokRes.json()) as { token: string }).token };
@@ -420,10 +437,19 @@ export async function handleExchangeDeleteBranch(req: Request, env: Env): Promis
   if (branch.startsWith("claude/")) {
     const owner = repo.split("/")[0];
     let merged = false;
-    const prRes = await gh(`/pulls?head=${encodeURIComponent(`${owner}:${branch}`)}&state=all&per_page=100`);
-    if (prRes.ok) {
-      const prs = await prRes.json().catch(() => []) as Array<{ merged_at?: string }>;
-      merged = Array.isArray(prs) && prs.some((pr) => pr && pr.merged_at);
+    // Authoritative signal: a merged PR for this head — the only way to see a
+    // SQUASH-merge (its head never becomes an ancestor of the default branch, so
+    // the compare fallback below can't). Listing PRs needs pull_requests:read,
+    // which the operational `tok` (APP_PERMS) lacks, so mint a separate read token.
+    // Null = the installation hasn't re-accepted the widened grant yet → skip this
+    // check and fall through to the conservative compare path (never lose work).
+    const prTok = await installationToken(env, repo, PR_READ_PERMS);
+    if (prTok && "token" in prTok) {
+      const prRes = await fetch(`${GH}/repos/${repo}/pulls?head=${encodeURIComponent(`${owner}:${branch}`)}&state=all&per_page=100`, { headers: ghHeaders(prTok.token) });
+      if (prRes.ok) {
+        const prs = await prRes.json().catch(() => []) as Array<{ merged_at?: string }>;
+        merged = Array.isArray(prs) && prs.some((pr) => pr && pr.merged_at);
+      }
     }
     if (!merged) {
       const repoRes = await gh("");
