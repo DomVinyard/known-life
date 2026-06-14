@@ -161,11 +161,18 @@ export async function exchangeCode(
   return cfTokenRequest(env, body);
 }
 
-export async function refreshAccessToken(env: Env, refreshToken: string): Promise<CfTokenResponse> {
+export async function refreshAccessToken(env: Env, refreshToken: string, scope?: string): Promise<CfTokenResponse> {
   const body = new URLSearchParams({
     grant_type: "refresh_token",
     refresh_token: refreshToken,
   });
+  // Optional DOWNSCOPE: request a narrower subset of the granted scopes (RFC 6749
+  // §6 — "MUST NOT include any scope not originally granted"). Each per-deploy
+  // token then carries only what that deploy needs, so a leaked short-lived token
+  // can touch far less of the user's account. Omitted → CF returns the full
+  // granted set (unchanged behavior). The CALLER decides whether to persist the
+  // rotated refresh token — a downscoped refresh must not shrink the stored grant.
+  if (scope && scope.trim()) body.set("scope", scope.trim());
   return cfTokenRequest(env, body);
 }
 
@@ -265,15 +272,26 @@ export async function getGrant(env: Env, login: string): Promise<CfGrant | null>
 export async function mintAccessToken(
   env: Env,
   login: string,
-): Promise<{ access_token: string; expires_in: number; account_id: string | null } | null> {
+  scope?: string,
+): Promise<{ access_token: string; expires_in: number; account_id: string | null; scope: string | null } | null> {
   const grant = await getGrant(env, login);
   if (!grant) return null;
   const refresh = await decryptSecret(env, grant.refresh_token_enc);
-  const tok = await refreshAccessToken(env, refresh);
-  if (tok.refresh_token && tok.refresh_token !== refresh) {
+  const downscoped = Boolean(scope && scope.trim());
+  const tok = await refreshAccessToken(env, refresh, scope);
+  // Persist the rotated refresh token ONLY on a FULL mint. A downscoped refresh
+  // may return a refresh token narrowed to the requested subset; persisting that
+  // would permanently shrink the stored grant. So a downscoped mint never mutates
+  // the grant — it reuses the stored full-grant refresh token next time.
+  if (!downscoped && tok.refresh_token && tok.refresh_token !== refresh) {
     grant.refresh_token_enc = await encryptSecret(env, tok.refresh_token);
     grant.updated_at = Date.now();
     await putGrant(env, login, grant);
   }
-  return { access_token: tok.access_token, expires_in: tok.expires_in ?? 3600, account_id: grant.account_id };
+  return {
+    access_token: tok.access_token,
+    expires_in: tok.expires_in ?? 3600,
+    account_id: grant.account_id,
+    scope: tok.scope ?? null,
+  };
 }
