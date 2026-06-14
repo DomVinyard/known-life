@@ -10,7 +10,7 @@ import {
   CF_OAUTH_SCOPES,
   type CfGrant,
 } from "../src/registry/lib/cf-oauth";
-import { handleCfOAuthStart, handleCfOAuthStatus, handleCfOAuthToken, parseDownscope } from "../src/registry/routes/cloudflare-oauth";
+import { handleCfOAuthStart, handleCfOAuthStatus, handleCfOAuthToken } from "../src/registry/routes/cloudflare-oauth";
 import { issueRegistryToken } from "../src/registry/lib/jwt";
 
 // The CF OAuth flow is the paste-free infra-onboarding credential path: a wrong
@@ -205,22 +205,5 @@ describe("POST /api/setup/cf-oauth/token (the brokered mint surface)", () => {
     const res = await post(e, { Authorization: `Bearer ${bearer}` });
     expect(res.status).toBe(409);
     expect(((await res.json()) as { error: string }).error).toBe("not_connected");
-  });
-});
-
-describe("parseDownscope (optional least-privilege subset)", () => {
-  const reg = ["workers-scripts.read", "queues.read", "ai.read"];
-  it("omitted scope → no downscope (full grant)", () => {
-    expect(parseDownscope({}, reg)).toEqual({ scope: undefined, bad: [] });
-    expect(parseDownscope({ scope: "" }, reg)).toEqual({ scope: undefined, bad: [] });
-  });
-  it("accepts a string or array subset, deduped + space-joined", () => {
-    expect(parseDownscope({ scope: "queues.read workers-scripts.read" }, reg).scope).toBe("queues.read workers-scripts.read");
-    expect(parseDownscope({ scope: ["ai.read", "ai.read"] }, reg).scope).toBe("ai.read");
-  });
-  it("flags any unregistered id and yields no scope (no form-param injection)", () => {
-    const r = parseDownscope({ scope: "queues.read not-a-scope d1.write" }, reg);
-    expect(r.bad).toEqual(["not-a-scope", "d1.write"]);
-    expect(r.scope).toBeUndefined();
   });
 });

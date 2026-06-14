@@ -11,7 +11,6 @@ import {
   putGrant,
   getGrant,
   mintAccessToken,
-  CF_OAUTH_SCOPES,
   genVerifier,
   s256,
   randomToken,
@@ -196,22 +195,9 @@ export async function handleCfOAuthToken(req: Request, env: Env): Promise<Respon
   const grant = await getGrant(env, login);
   if (!grant) return json(409, { error: "not_connected", hint: "no Cloudflare grant — run cf-oauth/start and consent first" });
 
-  // Optional DOWNSCOPE: a caller may request a narrower subset of the granted
-  // scopes for a least-privilege per-deploy token. Cloudflare independently
-  // enforces ⊆ the user's actual grant; we reject unregistered IDs up front.
-  let parsed;
-  try {
-    const bodyText = await req.text();
-    parsed = parseDownscope(bodyText ? JSON.parse(bodyText) : {}, CF_OAUTH_SCOPES);
-  } catch {
-    return json(400, { error: "bad_request", hint: "body must be JSON; optional `scope` is a string or array of scope IDs" });
-  }
-  if (parsed.bad.length) return json(400, { error: "invalid_scope", hint: `not registered scopes: ${parsed.bad.join(", ")}` });
-  const scope = parsed.scope;
-
   let minted;
   try {
-    minted = await mintAccessToken(env, login, scope);
+    minted = await mintAccessToken(env, login);
   } catch (e) {
     return json(502, { error: "mint_failed", hint: String((e as Error).message) });
   }
@@ -224,26 +210,10 @@ export async function handleCfOAuthToken(req: Request, env: Env): Promise<Respon
     access_token: minted.access_token,
     account_id: minted.account_id ?? grant.account_id,
     expires_in: minted.expires_in,
-    scope: minted.scope,
   });
 }
 
 // --- helpers ---
-
-// Parse + validate an optional downscope request: `scope` may be a space-joined
-// string or an array of dot-notation scope IDs. Returns the canonical space-joined
-// subset (deduped) when every requested ID is registered, else lists the bad ones.
-// Pure (no env/network) so it's unit-tested directly. The charset guard is the
-// `registered` membership check — an ID not in the registered set can never reach
-// the CF token request, so a crafted `scope` can't inject form parameters.
-export function parseDownscope(body: unknown, registered: readonly string[]): { scope?: string; bad: string[] } {
-  const b = body && typeof body === "object" ? (body as { scope?: unknown }) : {};
-  const raw = Array.isArray(b.scope) ? b.scope : typeof b.scope === "string" ? b.scope.split(/\s+/) : [];
-  const want = raw.map((s) => String(s).trim()).filter(Boolean);
-  const bad = want.filter((s) => !registered.includes(s));
-  const scope = !bad.length && want.length ? Array.from(new Set(want)).join(" ") : undefined;
-  return { scope, bad };
-}
 
 function json(status: number, data: unknown): Response {
   return new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json; charset=utf-8" } });

@@ -47,11 +47,13 @@ const CF_ACCOUNTS = "https://api.cloudflare.com/client/v4/accounts";
 // re-consent flow is exactly the recurring-new-grant shape the durable-github-
 // verifier "within-grant rule" scar warns against, and it's edge-case-rich. These
 // are all developer-platform scopes (not personal data), per-user-consented, and
-// the refresh token only ever mints during that user's own deploys. Least-privilege
-// is recovered at MINT time instead (downscope the per-deploy token to a subset of
-// the granted set — standard OAuth2 refresh-grant narrowing), with zero UX cost.
-// Security/zone-admin scopes (WAF, firewall, load-balancers, access-management,
-// DNS-security, billing) are intentionally excluded.
+// the refresh token only ever mints during that user's own deploys. ⚠ Note: a
+// minted per-deploy token carries the FULL grant — Cloudflare IGNORES a narrowed
+// `scope` on the refresh-token grant (verified live 2026-06-14, #597 reverted), so
+// least-privilege-at-mint is NOT achievable here. The broad-once decision stands on
+// its other merits; just know the tokens are broad. Security/zone-admin scopes
+// (WAF, firewall, load-balancers, access-management, DNS-security, billing) are
+// intentionally excluded from the grant itself, which is the real bound.
 export const CF_OAUTH_SCOPES = [
   // identity + refresh
   "memberships.read", // list the user's accounts (the callback's GET /accounts)
@@ -161,18 +163,11 @@ export async function exchangeCode(
   return cfTokenRequest(env, body);
 }
 
-export async function refreshAccessToken(env: Env, refreshToken: string, scope?: string): Promise<CfTokenResponse> {
+export async function refreshAccessToken(env: Env, refreshToken: string): Promise<CfTokenResponse> {
   const body = new URLSearchParams({
     grant_type: "refresh_token",
     refresh_token: refreshToken,
   });
-  // Optional DOWNSCOPE: request a narrower subset of the granted scopes (RFC 6749
-  // §6 — "MUST NOT include any scope not originally granted"). Each per-deploy
-  // token then carries only what that deploy needs, so a leaked short-lived token
-  // can touch far less of the user's account. Omitted → CF returns the full
-  // granted set (unchanged behavior). The CALLER decides whether to persist the
-  // rotated refresh token — a downscoped refresh must not shrink the stored grant.
-  if (scope && scope.trim()) body.set("scope", scope.trim());
   return cfTokenRequest(env, body);
 }
 
@@ -272,26 +267,15 @@ export async function getGrant(env: Env, login: string): Promise<CfGrant | null>
 export async function mintAccessToken(
   env: Env,
   login: string,
-  scope?: string,
-): Promise<{ access_token: string; expires_in: number; account_id: string | null; scope: string | null } | null> {
+): Promise<{ access_token: string; expires_in: number; account_id: string | null } | null> {
   const grant = await getGrant(env, login);
   if (!grant) return null;
   const refresh = await decryptSecret(env, grant.refresh_token_enc);
-  const downscoped = Boolean(scope && scope.trim());
-  const tok = await refreshAccessToken(env, refresh, scope);
-  // Persist the rotated refresh token ONLY on a FULL mint. A downscoped refresh
-  // may return a refresh token narrowed to the requested subset; persisting that
-  // would permanently shrink the stored grant. So a downscoped mint never mutates
-  // the grant — it reuses the stored full-grant refresh token next time.
-  if (!downscoped && tok.refresh_token && tok.refresh_token !== refresh) {
+  const tok = await refreshAccessToken(env, refresh);
+  if (tok.refresh_token && tok.refresh_token !== refresh) {
     grant.refresh_token_enc = await encryptSecret(env, tok.refresh_token);
     grant.updated_at = Date.now();
     await putGrant(env, login, grant);
   }
-  return {
-    access_token: tok.access_token,
-    expires_in: tok.expires_in ?? 3600,
-    account_id: grant.account_id,
-    scope: tok.scope ?? null,
-  };
+  return { access_token: tok.access_token, expires_in: tok.expires_in ?? 3600, account_id: grant.account_id };
 }
